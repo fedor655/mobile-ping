@@ -357,7 +357,7 @@ def _operator_of(ip, src_ip, timeout):
     return ""
 
 
-def egress_info(src_ip, own_server=None, timeout=5, budget=20):
+def egress_info(src_ip, own_server=None, timeout=3, budget=8):
     """
     Узнать, с какого внешнего адреса виден трафик, уходящий с src_ip.
 

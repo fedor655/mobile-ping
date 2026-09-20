@@ -483,21 +483,36 @@ class Agent:
         self.report_running(job, payload)
 
         pattern = dev.get("adapter")
-        adapter = netinfo.find_adapter(pattern) if pattern else None
-        if adapter is None:
+        found = netinfo.match_adapters(pattern) if pattern else []
+        if not found:
             payload.update(error="адаптер %r не найден: телефон отключён или "
                                  "выключен режим USB-модема" % pattern,
                            finished_at=time.time())
             log("--- устройство %r: адаптер %r не найден" % (name, pattern))
             return payload
-        if not adapter["ipv4"]:
-            payload.update(error="у адаптера %r нет адреса: телефон не раздаёт "
-                                 "интернет" % adapter["name"],
+        if len(found) > 1:
+            # Молча взять первый — верный способ месяцами мерить не тот телефон.
+            payload.update(error="описание %r подходит сразу нескольким "
+                                 "адаптерам (%s). Укажите точное имя или MAC."
+                                 % (pattern, ", ".join(a["name"] for a in found)),
                            finished_at=time.time())
-            log("--- устройство %r: у %r нет адреса" % (name, adapter["name"]))
+            log("--- устройство %r: %r подходит нескольким: %s"
+                % (name, pattern, ", ".join(a["name"] for a in found)))
             return payload
 
-        src_ip = adapter["ipv4"][0]
+        adapter = found[0]
+        src_ip = netinfo.usable_ipv4(adapter)
+        if not src_ip:
+            apipa = any(ip.startswith("169.254.") for ip in adapter["ipv4"])
+            payload.update(error=("адаптер %s получил только адрес 169.254.x — "
+                                  "телефон не выдал адрес по DHCP: переткните "
+                                  "кабель или заново включите режим модема"
+                                  % adapter["name"]) if apipa else
+                                 ("у адаптера %s нет адреса: телефон не "
+                                  "раздаёт интернет" % adapter["name"]),
+                           finished_at=time.time())
+            log("--- устройство %r: %s" % (name, payload["error"]))
+            return payload
         payload.update(ssid=adapter["name"], local_ip=src_ip,
                        gateway=adapter["gateways"][0] if adapter["gateways"]
                        else None)
@@ -650,6 +665,45 @@ def selftest(cfg):
             print("  устройство: %-6s Wi-Fi,  точка %r" % (d["name"], d.get("ssid")))
 
 
+def show_adapters(cfg):
+    """
+    Готовый кусок настроек по тому, что сейчас воткнуто в USB.
+
+    Имя адаптера привязано к устройству и порту и переживает переподключение,
+    поэтому опознаём по нему; MAC печатаем рядом как запасной вариант, если
+    телефоны будут переставляться между портами.
+    """
+    usb = netinfo.usb_tethering_adapters()
+    if not usb:
+        print("Телефонов на кабеле не найдено. Включите на телефоне режим "
+              "USB-модема и проверьте кабель.")
+        return
+
+    known = {d.get("adapter"): d for d in cfg["devices"] if is_usb(d)}
+    print("Найдено телефонов на кабеле: %d" % len(usb))
+    print("")
+    lines = []
+    for i, a in enumerate(usb, start=1):
+        ip = netinfo.usable_ipv4(a)
+        state = ip or ("только 169.254.x — DHCP не отработал"
+                       if a["ipv4"] else "без адреса")
+        mark = "уже в настройках" if a["name"] in known else "новый"
+        print("  %-14s %-34s %-32s %s" % (a["name"], a["description"][:34],
+                                          state, mark))
+        print("      MAC %s" % a["mac"])
+        lines.append('    {"name": "№%d", "operator": "?", "link": "usb", '
+                     '"adapter": "%s"}' % (i, a["name"]))
+
+    print("")
+    print("Готовый блок devices для agent.config.json:")
+    print("")
+    print('  "devices": [')
+    print(",\n".join(lines))
+    print("  ]")
+    print("")
+    print("Поле operator заполните сами — это то, что видно на сайте.")
+
+
 def local_run(cfg, targets, ports, device_names=None):
     """Прогон без сервера: переключаемся по телефонам и печатаем таблицу."""
     agent = Agent(cfg)
@@ -704,6 +758,8 @@ def main():
     ap.add_argument("--config", default=CONFIG_PATH)
     ap.add_argument("--selftest", action="store_true",
                     help="диагностика сети, ничего не переключает")
+    ap.add_argument("--adapters", action="store_true",
+                    help="телефоны на кабеле и готовый блок настроек")
     ap.add_argument("--local", nargs="*", metavar="ЦЕЛЬ",
                     help="прогон без сервера по указанным целям")
     ap.add_argument("--ports", default="443,80")
@@ -714,6 +770,9 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+
+    if args.adapters:
+        return show_adapters(cfg)
 
     if args.selftest:
         return selftest(cfg)

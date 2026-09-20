@@ -202,22 +202,59 @@ def by_index(index):
     return None
 
 
-def find_adapter(pattern):
+def _norm_mac(s):
+    return "".join(c for c in (s or "").lower() if c in "0123456789abcdef")
+
+
+def match_adapters(pattern):
     """
-    Найти адаптер по имени или описанию: точное совпадение имени, иначе
-    подстрока. Так телефон, подключённый по USB, задаётся в настройках как
-    «UsbNcm» или «Remote NDIS», а не индексом, который меняется.
+    Все адаптеры, подходящие под описание, по убыванию точности совпадения.
+
+    Годится точное имя («Ethernet 5»), MAC («4e:7a:04:3e:84:65») или подстрока
+    имени либо описания. Индекс не используется: он меняется при
+    переподключении кабеля.
+
+    Возвращает список, а не один адаптер, потому что у нескольких телефонов
+    описания различаются лишь номером («Remote NDIS Compatible Device #2»), и
+    подстрока «Remote NDIS» подходит сразу всем. Про такую неоднозначность
+    честнее сказать вслух, чем молча взять первый попавшийся.
     """
     if not pattern:
-        return None
+        return []
     ads = adapters()
-    for a in ads:
-        if a["name"] == pattern:
-            return a
+
+    exact = [a for a in ads if a["name"] == pattern]
+    if exact:
+        return exact
+
+    mac = _norm_mac(pattern)
+    if len(mac) == 12:
+        by_mac = [a for a in ads if _norm_mac(a["mac"]) == mac]
+        if by_mac:
+            return by_mac
+
     low = pattern.lower()
-    for a in ads:
-        if low in a["name"].lower() or low in a["description"].lower():
-            return a
+    return [a for a in ads
+            if low in a["name"].lower() or low in a["description"].lower()]
+
+
+def find_adapter(pattern):
+    """Единственный подходящий адаптер, иначе None (в том числе при неоднозначности)."""
+    found = match_adapters(pattern)
+    return found[0] if len(found) == 1 else None
+
+
+def usable_ipv4(adapter):
+    """
+    Рабочий адрес адаптера: без APIPA.
+
+    169.254.x.x Windows выдаёт сама, когда DHCP не ответил. Адрес вроде бы
+    есть, но сети за ним нет, и замер с него молча превращается в «цель не
+    отвечает» — как раз та подмена, от которой мы уходим.
+    """
+    for ip in (adapter or {}).get("ipv4", []):
+        if not ip.startswith("169.254."):
+            return ip
     return None
 
 
