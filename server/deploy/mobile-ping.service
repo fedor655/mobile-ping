@@ -1,0 +1,25 @@
+[Unit]
+Description=mobile-ping — очередь заданий и сайт проверки доступности с мобильных сетей
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mobile-ping
+Group=mobile-ping
+WorkingDirectory=/opt/mobile-ping/server
+EnvironmentFile=/etc/mobile-ping.env
+ExecStart=/usr/bin/python3 /opt/mobile-ping/server/app.py
+Restart=always
+RestartSec=3
+
+# база лежит в /var/lib, в каталог с кодом писать не нужно
+StateDirectory=mobile-ping
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mobile-ping
+
+[Install]
+WantedBy=multi-user.target

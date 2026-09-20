@@ -1,0 +1,16 @@
+# секреты и локальные настройки — в репозиторий не попадают
+agent/agent.config.json
+agent/*.log
+server/*.db
+server/*.db-wal
+server/*.db-shm
+*.env
+secrets/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.DS_Store
+Thumbs.db

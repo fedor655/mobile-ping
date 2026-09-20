@@ -1,0 +1,42 @@
+{
+  "_комментарий": "Скопируйте этот файл в agent.config.json и заполните. Настоящий agent.config.json в git не попадает — в нём токен и пароли Wi-Fi.",
+
+  "server": "http://ВАШ_СЕРВЕР:8091",
+  "token": "ТОКЕН_ИЗ_/etc/mobile-ping.env_НА_СЕРВЕРЕ",
+  "agent_id": "laptop-home",
+
+  "wifi_adapter": null,
+  "_wifi_adapter": "null = найти Wi-Fi адаптер автоматически. Иначе точное имя, например \"Беспроводная сеть\".",
+
+  "home": {
+    "ssid": "ИМЯ_ОБЫЧНОЙ_СЕТИ",
+    "password": null
+  },
+  "_home": "Сеть, в которую агент возвращается после обхода телефонов, чтобы отдать результаты. password: null — использовать уже сохранённый в Windows профиль.",
+
+  "devices": [
+    {
+      "name": "телефон-1",
+      "ssid": "SSID_ТОЧКИ_ТЕЛЕФОНА",
+      "password": "ПАРОЛЬ_ТОЧКИ"
+    },
+    {
+      "name": "телефон-2",
+      "ssid": "ВТОРАЯ_ТОЧКА",
+      "password": "ПАРОЛЬ"
+    }
+  ],
+
+  "poll_interval": 5,
+  "connect_timeout": 45,
+  "dhcp_timeout": 30,
+  "settle_sec": 3,
+
+  "icmp_count": 4,
+  "icmp_timeout_ms": 2000,
+  "tcp_timeout": 3.0,
+  "parallel": 4,
+
+  "known_non_mobile_ips": [],
+  "_known_non_mobile_ips": "Внешние IP, которые точно НЕ являются мобильным интернетом (например адрес домашнего VPN). Если на телефоне обнаружится такой — результат пометится как недостоверный."
+}

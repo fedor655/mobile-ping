@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mobile-ping</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>mobile-ping</h1>
+  <span class="sub">проверка доступности с мобильного интернета телефонов</span>
+</header>
+
+<div class="card">
+  <h2>Новая проверка</h2>
+  <form id="f">
+    <label for="targets">Адреса — по одному в строке. Можно <code>1.2.3.4</code>,
+      <code>example.com</code>, <code>1.2.3.4:8443</code></label>
+    <textarea id="targets" name="targets" spellcheck="false"
+      placeholder="1.1.1.1&#10;8.8.8.8&#10;example.com:443"></textarea>
+
+    <div class="row">
+      <div>
+        <label for="ports">TCP-порты (кроме указанных в адресе)</label>
+        <input type="text" id="ports" value="443,80">
+      </div>
+      <div>
+        <label for="icmp">ICMP-пакетов на цель</label>
+        <input type="number" id="icmp" value="4" min="1" max="10">
+      </div>
+      <div>
+        <label for="note">Пометка (необязательно)</label>
+        <input type="text" id="note" placeholder="например: проверка перед запуском">
+      </div>
+    </div>
+
+    <div style="margin-top:16px">
+      <label>Устройства</label>
+      <div class="devices" id="devices"><span class="empty">загрузка…</span></div>
+    </div>
+
+    <div style="margin-top:18px">
+      <button type="submit" id="go">Запустить</button>
+      <span class="msg" id="msg"></span>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Последние проверки</h2>
+  <div id="jobs"><span class="empty">загрузка…</span></div>
+</div>
+
+</div>
+<script src="/static/common.js"></script>
+<script>
+let agents = [];
+
+async function loadAgents() {
+  const box = document.getElementById('devices');
+  try {
+    const data = await getJSON('/api/agents');
+    agents = data.agents || [];
+  } catch (e) { box.textContent = 'не удалось получить список агентов'; return; }
+
+  const all = [];
+  for (const a of agents) for (const d of (a.devices || []))
+    all.push({ name: d.name, ssid: d.ssid, online: a.online, agent: a.id });
+
+  if (!all.length) {
+    box.innerHTML = '<span class="empty">агент ещё не отметился. ' +
+      'Задание всё равно можно поставить — оно подождёт в очереди.</span>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const d of all) {
+    const l = document.createElement('label');
+    l.innerHTML = '<input type="checkbox" checked value="' + esc(d.name) + '">' +
+      '<span class="dot ' + (d.online ? 'on' : '') + '"></span>' +
+      esc(d.name) + ' <span class="tiny">' + esc(d.ssid || '') + '</span>';
+    box.appendChild(l);
+  }
+}
+
+async function loadJobs() {
+  const box = document.getElementById('jobs');
+  let data;
+  try { data = await getJSON('/api/jobs'); }
+  catch (e) { box.textContent = 'не удалось получить список'; return; }
+  const jobs = data.jobs || [];
+  if (!jobs.length) { box.innerHTML = '<span class="empty">пока пусто</span>'; return; }
+
+  let h = '<table><thead><tr><th>Когда</th><th>Статус</th><th>Цели</th>' +
+          '<th>Пометка</th><th>Агент</th></tr></thead><tbody>';
+  for (const j of jobs) {
+    h += '<tr>' +
+      '<td class="mono"><a href="/j/' + esc(j.id) + '">' + fmtTime(j.created_at) + '</a></td>' +
+      '<td><span class="pill ' + esc(j.status) + '">' + statusRu(j.status) + '</span></td>' +
+      '<td class="mono">' + esc(j.targets.slice(0, 3).join(', ')) +
+        (j.targets.length > 3 ? ' <span class="tiny">+' + (j.targets.length - 3) + '</span>' : '') + '</td>' +
+      '<td>' + esc(j.note || '') + '</td>' +
+      '<td class="tiny">' + esc(j.agent_id || '') + '</td>' +
+      '</tr>';
+  }
+  box.innerHTML = h + '</tbody></table>';
+}
+
+document.getElementById('f').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const btn = document.getElementById('go');
+  const msg = document.getElementById('msg');
+  msg.className = 'msg'; msg.textContent = '';
+  btn.disabled = true;
+
+  const checked = [...document.querySelectorAll('#devices input:checked')]
+    .map(i => i.value);
+  const boxes = document.querySelectorAll('#devices input');
+
+  try {
+    const res = await postJSON('/api/jobs', {
+      targets: document.getElementById('targets').value,
+      ports: document.getElementById('ports').value,
+      icmp_count: document.getElementById('icmp').value,
+      note: document.getElementById('note').value,
+      devices: (boxes.length && checked.length < boxes.length) ? checked : null,
+    });
+    location.href = res.url;
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = e.message;
+    btn.disabled = false;
+  }
+});
+
+loadAgents();
+loadJobs();
+setInterval(loadJobs, 10000);
+setInterval(loadAgents, 15000);
+</script>
+</body>
+</html>

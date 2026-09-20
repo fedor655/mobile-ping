@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Проверка — mobile-ping</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>Проверка <span class="mono" id="jid"></span></h1>
+  <span id="st"></span>
+  <a href="/">← к списку</a>
+</header>
+
+<div id="warn"></div>
+
+<div class="card">
+  <h2>Устройства</h2>
+  <div id="devices"><span class="empty">загрузка…</span></div>
+</div>
+
+<div class="card">
+  <h2>Результаты</h2>
+  <div id="matrix"><span class="empty">загрузка…</span></div>
+  <p class="tiny" style="margin-top:14px">
+    В ячейке: доля дошедших ICMP-пакетов и средний RTT, ниже — TCP-порты.
+    <b class="cell-ok">Зелёное</b> — отвечает, <b class="cell-bad">красное</b> — нет,
+    <b class="cell-mid">жёлтое</b> — ICMP молчит, но TCP открыт (частый случай:
+    хост жив, но режет ping).
+  </p>
+</div>
+
+</div>
+<script src="/static/common.js"></script>
+<script>
+const jobId = location.pathname.split('/').filter(Boolean).pop();
+document.getElementById('jid').textContent = jobId;
+let timer = null;
+
+function cellHTML(r) {
+  if (!r) return '<span class="cell-na">—</span>';
+  if (r.error) return '<span class="cell-bad">ошибка</span>' +
+                      '<div class="tiny">' + esc(r.error) + '</div>';
+
+  const sent = r.icmp_sent || 0, recv = r.icmp_recv || 0;
+  const icmpOk = recv > 0;
+  const tcp = r.tcp || [];
+  const tcpOk = tcp.some(t => t.ok);
+  const cls = icmpOk ? 'cell-ok' : (tcpOk ? 'cell-mid' : 'cell-bad');
+
+  let h = '<span class="' + cls + '"><b>';
+  h += icmpOk ? (recv + '/' + sent) : (sent ? '0/' + sent : '—');
+  if (icmpOk && r.rtt_avg != null) h += ' · ' + Math.round(r.rtt_avg) + ' мс';
+  h += '</b></span>';
+
+  if (!icmpOk && r.icmp_status)
+    h += '<div class="tiny">' + esc(r.icmp_status) + '</div>';
+
+  if (tcp.length) {
+    const parts = tcp.map(t => '<span class="' + (t.ok ? 'cell-ok' : 'cell-bad') +
+      '">' + t.port + (t.ok && t.ms != null ? ' ' + Math.round(t.ms) + 'мс' : '') +
+      '</span>');
+    h += '<div class="tiny">TCP ' + parts.join(' ') + '</div>';
+  }
+  if (r.resolved_ip && r.resolved_ip !== r.target)
+    h += '<div class="tiny">' + esc(r.resolved_ip) + '</div>';
+  return h;
+}
+
+function render(job) {
+  document.getElementById('st').innerHTML =
+    '<span class="pill ' + esc(job.status) + '">' + statusRu(job.status) + '</span>';
+
+  const warn = document.getElementById('warn');
+  let w = '';
+  if (job.status === 'queued')
+    w = 'Задание в очереди — ждём, когда агент его заберёт. ' +
+        'Если агент не запущен, оно будет ждать.';
+  if (job.error) w = 'Ошибка: ' + esc(job.error);
+  const bad = (job.devices || []).filter(d => d.status === 'done' && !d.egress_ok);
+  if (bad.length)
+    w += (w ? '<br>' : '') + 'Внимание: у устройств ' +
+      bad.map(d => esc(d.device)).join(', ') +
+      ' не подтверждён выход через мобильную сеть — результаты могут быть ' +
+      'сняты не с того канала.';
+  warn.innerHTML = w ? '<div class="banner">' + w + '</div>' : '';
+
+  // --- устройства ---
+  const devs = job.devices || [];
+  const dbox = document.getElementById('devices');
+  if (!devs.length) {
+    dbox.innerHTML = '<span class="empty">агент ещё не начал</span>';
+  } else {
+    let h = '<table><thead><tr><th>Устройство</th><th>Статус</th><th>SSID</th>' +
+            '<th>Сигнал</th><th class="mono">IP в сети</th>' +
+            '<th class="mono">Внешний IP</th><th>Оператор</th><th>Время</th>' +
+            '</tr></thead><tbody>';
+    for (const d of devs) {
+      h += '<tr><td><b>' + esc(d.device) + '</b></td>' +
+        '<td><span class="pill ' + (d.status === 'done' ? 'done' :
+             d.status === 'running' ? 'running' : 'failed') + '">' +
+             statusRu(d.status) + '</span>' +
+             (d.error ? '<div class="tiny">' + esc(d.error) + '</div>' : '') + '</td>' +
+        '<td>' + esc(d.ssid || '—') + '</td>' +
+        '<td>' + esc(d.signal || '—') + '</td>' +
+        '<td class="mono">' + esc(d.local_ip || '—') + '</td>' +
+        '<td class="mono">' + (d.egress_ip
+            ? '<span class="' + (d.egress_ok ? 'cell-ok' : 'cell-bad') + '">' +
+              esc(d.egress_ip) + '</span>'
+            : '<span class="cell-na">—</span>') + '</td>' +
+        '<td class="tiny">' + esc(d.egress_info || '') + '</td>' +
+        '<td class="tiny">' + fmtDur(d.started_at, d.finished_at) + '</td></tr>';
+    }
+    dbox.innerHTML = h + '</tbody></table>';
+  }
+
+  // --- матрица ---
+  const names = devs.map(d => d.device);
+  const mbox = document.getElementById('matrix');
+  if (!names.length) {
+    mbox.innerHTML = '<span class="empty">результатов пока нет</span>';
+    return;
+  }
+  let h = '<table class="matrix"><thead><tr><th>Цель</th>';
+  for (const n of names) h += '<th>' + esc(n) + '</th>';
+  h += '</tr></thead><tbody>';
+  for (const t of job.targets) {
+    h += '<tr><td class="t">' + esc(t) + '</td>';
+    for (const n of names)
+      h += '<td>' + cellHTML(((job.results || {})[n] || {})[t]) + '</td>';
+    h += '</tr>';
+  }
+  mbox.innerHTML = h + '</tbody></table>';
+}
+
+async function tick() {
+  try {
+    const job = await getJSON('/api/jobs/' + encodeURIComponent(jobId));
+    render(job);
+    if (job.status === 'done' || job.status === 'failed') {
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+  } catch (e) {
+    document.getElementById('warn').innerHTML =
+      '<div class="banner">' + esc(e.message) + '</div>';
+  }
+}
+
+tick();
+timer = setInterval(tick, 3000);
+</script>
+</body>
+</html>
