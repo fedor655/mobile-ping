@@ -23,14 +23,20 @@
 
 <div class="card">
   <h2>Устройства</h2>
-  <div id="devices"><span class="empty">загрузка…</span></div>
+  <div class="scroll" id="devices"><span class="empty">загрузка…</span></div>
 </div>
 
 <div class="card">
-  <h2>Результаты</h2>
-  <div id="matrix"><span class="empty">загрузка…</span></div>
+  <h2>Результаты
+    <label class="logfoot" style="margin:0 0 0 10px; text-transform:none">
+      <input type="checkbox" id="compact"> компактно
+    </label>
+  </h2>
+  <div class="scroll" id="matrix"><span class="empty">загрузка…</span></div>
   <p class="tiny" style="margin-top:14px">
-    Зелёное — отвечает; красное — нет; жёлтое — ICMP молчит, но TCP открыт.<br>
+    <b class="cell-ok">Зелёное</b> — отвечает;
+    <b class="cell-bad">красное</b> — нет;
+    <b class="cell-mid">жёлтое</b> — ICMP молчит, но TCP открыт.<br>
     Для доменов на порту 443 делается настоящее TLS-рукопожатие с SNI.
   </p>
 </div>
@@ -48,9 +54,13 @@
 <script>
 const jobId = location.pathname.split('/').filter(Boolean).pop();
 let timer = null;
+let compactTouched = false;
+document.getElementById('compact').addEventListener('change', () => {
+  compactTouched = true; lastRender = null; tick();
+});
 
 // Короткая причина отказа TLS: в ячейке нет места на полную формулировку,
-// а разбираться человек всё равно будет по журналу.
+// разбираться человек всё равно будет по журналу.
 function tlsShort(err) {
   const e = String(err || '');
   if (/без ответа/i.test(e)) return 'нет ответа';
@@ -59,51 +69,56 @@ function tlsShort(err) {
   return e.replace(/^TLS[: ]*/i, '') || 'не прошёл';
 }
 
+// Единый разбор результата: и подробная ячейка, и компактная, и подпись
+// опираются на один вывод, чтобы они не разошлись между собой.
+function readResult(r) {
+  const sent = r.icmp_sent || 0, recv = r.icmp_recv || 0;
+  const tcp = r.tcp || [];
+  const tlsTried = tcp.filter(t => t.tls !== undefined && t.tls !== null);
+  const o = {
+    sent, recv,
+    icmpOk: recv > 0,
+    tcp,
+    tcpOk: tcp.some(t => t.ok),
+    tlsTried,
+    blocked: tlsTried.length > 0 && tlsTried.every(t => !t.tls),
+    rtt: r.rtt_avg != null ? Math.round(r.rtt_avg) : null,
+  };
+  o.cls = o.blocked ? 'cell-bad'
+        : (o.icmpOk ? 'cell-ok' : (o.tcpOk ? 'cell-mid' : 'cell-bad'));
+  return o;
+}
+
 function kv(label, value, cls) {
   return '<span class="k">' + label + '</span>' +
          '<span class="' + (cls || '') + '">' + value + '</span>';
 }
 
-function cellHTML(r) {
-  if (!r) return '<span class="cell-na">—</span>';
-  if (r.error)
-    return '<div class="kv">' + kv('сбой', esc(r.error), 'cell-bad') + '</div>';
-
-  const sent = r.icmp_sent || 0, recv = r.icmp_recv || 0;
-  const icmpOk = recv > 0;
-  const tcp = r.tcp || [];
-  const tcpOk = tcp.some(t => t.ok);
-  // TLS главнее остального: DPI пропускает TCP и рвёт ClientHello, поэтому
-  // «порт открыт» при сорванном рукопожатии означает блокировку.
-  const tlsTried = tcp.filter(t => t.tls !== undefined && t.tls !== null);
-  const blocked = tlsTried.length > 0 && tlsTried.every(t => !t.tls);
-
+function cellFull(r) {
+  const o = readResult(r);
   let h = '<div class="kv">';
 
-  // ICMP: сколько дошло и за сколько
-  if (sent) {
-    h += kv('ICMP', (icmpOk ? recv + '/' + sent : '0/' + sent) +
-            (icmpOk && r.rtt_avg != null ? ' · ' + Math.round(r.rtt_avg) + ' мс' : ''),
-            icmpOk ? 'cell-ok' : 'cell-bad');
-    if (!icmpOk && r.icmp_status && r.icmp_status !== 'таймаут')
+  if (o.sent) {
+    h += kv('ICMP', (o.icmpOk ? o.recv + '/' + o.sent : '0/' + o.sent) +
+            (o.icmpOk && o.rtt != null ? ' · ' + o.rtt + ' мс' : ''),
+            o.icmpOk ? 'cell-ok' : 'cell-bad');
+    if (!o.icmpOk && r.icmp_status && r.icmp_status !== 'таймаут')
       h += kv('', '<span class="tiny">' + esc(r.icmp_status) + '</span>', '');
   }
 
-  // TCP: какие порты открылись и насколько быстро
-  if (tcp.length) {
-    const parts = tcp.map(t =>
+  if (o.tcp.length) {
+    const parts = o.tcp.map(t =>
       '<span class="' + (t.ok ? 'cell-ok' : 'cell-bad') + '">' + t.port +
       (t.ok && t.ms != null ? '<span class="tiny"> ' + Math.round(t.ms) + '</span>' : '') +
       '</span>');
     h += kv('TCP', parts.join(' · '), '');
   }
 
-  // TLS: собственно вердикт о блокировке
-  if (tlsTried.length) {
-    const good = tlsTried.find(t => t.tls);
+  if (o.tlsTried.length) {
+    const good = o.tlsTried.find(t => t.tls);
     h += good
       ? kv('TLS', esc(good.tls_proto || 'ок'), 'cell-ok')
-      : kv('TLS', esc(tlsShort(tlsTried[0].tls_error)) +
+      : kv('TLS', esc(tlsShort(o.tlsTried[0].tls_error)) +
            ' · <b>похоже на блокировку</b>', 'cell-bad');
   }
 
@@ -113,14 +128,44 @@ function cellHTML(r) {
   return h + '</div>';
 }
 
-function deviceLabel(d, i) {
-  // №1 "i" билайн — номер, имя точки, оператор. Всё одинаково читаемо.
-  let h = '<b>№' + (i + 1) + '</b>';
-  if (d.ssid) h += ' <span class="ssid">«' + esc(d.ssid) + '»</span>';
-  const op = d.operator || d.device;
-  if (op) h += ' <span class="op">' + esc(op) + '</span>';
-  return h;
+// Компактная ячейка: один значок на устройство, чтобы десяток телефонов
+// помещался в ширину экрана. Подробности — во всплывающей подсказке.
+function cellCompact(r) {
+  const o = readResult(r);
+  let label, hint;
+  if (o.blocked) {
+    label = 'блок';
+    hint = 'TCP открыт, но TLS ' + tlsShort(o.tlsTried[0].tls_error) +
+           ' — похоже на блокировку';
+  } else if (o.icmpOk) {
+    label = o.rtt != null ? o.rtt : '✓';
+    hint = 'ICMP ' + o.recv + '/' + o.sent +
+           (o.rtt != null ? ', ' + o.rtt + ' мс' : '');
+  } else if (o.tcpOk) {
+    label = 'TCP';
+    hint = 'ICMP молчит (' + (r.icmp_status || '—') + '), но TCP открыт';
+  } else {
+    label = '✗';
+    hint = r.icmp_status || 'не отвечает';
+  }
+  if (o.tcp.length)
+    hint += '\nTCP: ' + o.tcp.map(t => t.port + ' ' + (t.ok ? 'открыт' : 'нет'))
+                             .join(', ');
+  if (r.resolved_ip) hint += '\n' + r.resolved_ip;
+  return '<span class="badge ' + o.cls + '" title="' + esc(hint) + '">' +
+         esc(String(label)) + '</span>';
 }
+
+function cellHTML(r, compact) {
+  if (!r) return '<span class="cell-na">—</span>';
+  if (r.error)
+    return compact
+      ? '<span class="badge cell-bad" title="' + esc(r.error) + '">сбой</span>'
+      : '<div class="kv">' + kv('сбой', esc(r.error), 'cell-bad') + '</div>';
+  return compact ? cellCompact(r) : cellFull(r);
+}
+
+let lastRender = null;
 
 function render(job) {
   document.getElementById('title').textContent = '№' + (job.num || '—');
@@ -130,39 +175,47 @@ function render(job) {
   document.getElementById('csv').href = '/api/jobs/' + jobId + '/export.csv';
   document.getElementById('jsonl').href = '/api/jobs/' + jobId;
 
+  const devs = job.devices || [];
+
+  // Время: общее — от создания проверки до последнего результата. Сумма по
+  // устройствам меньше на то, что происходит между ними: ожидание в очереди,
+  // замер внешнего IP обычной сети, переключения и возврат домой.
   const end = job.finished_at || (job.status === 'running' ? Date.now() / 1000 : null);
-  document.getElementById('took').textContent = end
-    ? 'заняла ' + fmtDur(job.created_at, end) : '';
+  let onDevices = 0;
+  for (const d of devs)
+    if (d.started_at && d.finished_at) onDevices += d.finished_at - d.started_at;
+  const total = end ? end - job.created_at : null;
+  document.getElementById('took').textContent =
+    total ? 'заняла ' + fmtSec(total) : '';
 
   const warn = document.getElementById('warn');
   let w = '';
   if (job.status === 'queued')
     w = 'Задание в очереди — ждём, когда агент его заберёт.';
   if (job.error) w = 'Ошибка: ' + esc(job.error);
-  const bad = (job.devices || []).filter(d => d.status === 'done' && !d.egress_ok);
+  const bad = devs.filter(d => d.status === 'done' && !d.egress_ok);
   if (bad.length)
     w += (w ? '<br>' : '') + 'Внимание: у устройств ' +
-      bad.map(d => '"' + esc(d.operator || d.device) + '"').join(', ') +
+      bad.map(d => '"' + esc(devName(d)) + '"').join(', ') +
       ' не подтверждён выход через мобильную сеть';
   warn.innerHTML = w ? '<div class="banner">' + w + '</div>' : '';
 
   // --- устройства ---
-  const devs = job.devices || [];
   const dbox = document.getElementById('devices');
   if (!devs.length) {
     dbox.innerHTML = '<span class="empty">агент ещё не начал</span>';
   } else {
-    let h = '<table><thead><tr><th>Устройство</th><th>Статус</th>' +
-            '<th>Сигнал</th>' +
+    let h = '<table><thead><tr><th>№</th><th>Точка доступа</th><th>Оператор</th>' +
+            '<th>Статус</th><th>Сигнал</th>' +
             '<th class="mono" title="адрес, который выдал телефон по DHCP">' +
               'IP от точки</th>' +
             '<th class="mono" title="как нас видят снаружи — по нему и ' +
               'подтверждается, что выход мобильный">IP в интернете</th>' +
-            '<th>Оператор связи</th><th>Время</th></tr></thead><tbody>';
-    let total = 0;
+            '<th>Определился как</th><th>Время</th></tr></thead><tbody>';
     devs.forEach((d, i) => {
-      if (d.started_at && d.finished_at) total += d.finished_at - d.started_at;
-      h += '<tr><td>' + deviceLabel(d, i) + '</td>' +
+      h += '<tr><td><b>' + esc(devName(d, i)) + '</b></td>' +
+        '<td class="mono">' + (d.ssid ? '«' + esc(d.ssid) + '»' : '—') + '</td>' +
+        '<td>' + esc(d.operator || '—') + '</td>' +
         '<td><span class="pill ' + (d.status === 'done' ? 'done' :
              d.status === 'running' ? 'running' : 'failed') + '">' +
              statusRu(d.status) + '</span>' +
@@ -173,12 +226,14 @@ function render(job) {
             ? '<span class="' + (d.egress_ok ? 'cell-ok' : 'cell-bad') + '">' +
               esc(d.egress_ip) + '</span>'
             : '<span class="cell-na">—</span>') + '</td>' +
-        '<td>' + esc(d.egress_info || '—') + '</td>' +
+        '<td class="tiny">' + esc(d.egress_info || '—') + '</td>' +
         '<td>' + (d.started_at && d.finished_at
-                  ? fmtDur(d.started_at, d.finished_at) : '—') + '</td></tr>';
+                  ? fmtSec(d.finished_at - d.started_at) : '—') + '</td></tr>';
     });
-    h += '<tr class="totals"><td colspan="6">Итого по устройствам</td><td>' +
-         fmtSec(total) + '</td></tr>';
+    h += '<tr class="totals"><td colspan="8">На устройствах' +
+         (total ? ' · остальное (очередь, переключения, возврат) — ' +
+                  fmtSec(Math.max(0, total - onDevices)) : '') +
+         '</td><td>' + fmtSec(onDevices) + '</td></tr>';
     dbox.innerHTML = h + '</tbody></table>';
   }
 
@@ -188,16 +243,35 @@ function render(job) {
     mbox.innerHTML = '<span class="empty">результатов пока нет</span>';
     return;
   }
-  let h = '<table class="matrix"><thead><tr><th>Цель</th>';
-  devs.forEach((d, i) => { h += '<th>' + deviceLabel(d, i) + '</th>'; });
+  // При десятке устройств подробные ячейки не помещаются — сжимаем сами,
+  // но выбор человека важнее автоматики.
+  const box = document.getElementById('compact');
+  if (!compactTouched) box.checked = devs.length > 4;
+  const compact = box.checked;
+
+  let h = '<table class="matrix' + (compact ? ' compact' : '') +
+          '"><thead><tr><th>Цель</th>';
+  devs.forEach((d, i) => {
+    h += '<th title="' + esc([d.ssid && '«' + d.ssid + '»', d.operator]
+                             .filter(Boolean).join(' · ')) + '">' +
+         esc(devName(d, i)) + '</th>';
+  });
   h += '</tr></thead><tbody>';
   for (const t of job.targets) {
     h += '<tr><td class="t">' + esc(t) + '</td>';
     for (const d of devs)
-      h += '<td>' + cellHTML(((job.results || {})[d.device] || {})[t]) + '</td>';
+      h += '<td>' + cellHTML(((job.results || {})[d.device] || {})[t], compact) + '</td>';
     h += '</tr>';
   }
   mbox.innerHTML = h + '</tbody></table>';
+}
+
+// Имя устройства — это его номер. Точка доступа и оператор живут отдельно,
+// как привязанные к нему данные.
+function devName(d, i) {
+  if (d.num) return '№' + d.num;
+  if (d.device) return d.device;
+  return '№' + ((i || 0) + 1);
 }
 
 let lastLogCount = -1;
@@ -217,7 +291,6 @@ function renderLogs(logs) {
   let h = '';
   for (const l of logs) {
     const t = String(l.text || '');
-    // подсветка по смыслу строки: уровней агент не заводит
     let cls = '';
     if (/ВНИМАНИЕ|не удалось|не подключ|ошибк|отменён|недействител|исчез/i.test(t))
       cls = 'cell-bad';

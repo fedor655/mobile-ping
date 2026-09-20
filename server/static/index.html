@@ -12,7 +12,6 @@
 <header class="top">
   <h1>mobile-ping</h1>
   <span class="spacer"></span>
-  <span class="sub">(проверка доступности с мобильного интернета телефонов)</span>
   <a href="/api" class="btnlink">API</a>
 </header>
 
@@ -86,8 +85,9 @@ async function loadAgents() {
     l.innerHTML = '<input type="checkbox" value="' + esc(d.name) + '"' +
       (on ? ' checked' : '') + '>' +
       '<span class="dot ' + (d.online ? 'on' : '') + '"></span>' +
-      '<b>№' + (i + 1) + '</b> <span class="ssid">«' + esc(d.ssid || '?') +
-      '»</span> <span class="op">' + esc(d.operator || d.name) + '</span>';
+      '<b>' + esc(d.name || ('№' + (i + 1))) + '</b>' +
+      ' <span class="ssid">«' + esc(d.ssid || '?') + '»</span>' +
+      ' <span class="op">' + esc(d.operator || '') + '</span>';
     box.appendChild(l);
   });
 }

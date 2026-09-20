@@ -129,6 +129,7 @@ def db():
 MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN num INTEGER",
     "ALTER TABLE device_runs ADD COLUMN operator TEXT",
+    "ALTER TABLE device_runs ADD COLUMN num INTEGER",
 ]
 
 
@@ -289,7 +290,8 @@ def job_to_dict(conn, job_id, with_results=True):
         return job
 
     job["devices"] = [dict(r) for r in conn.execute(
-        "SELECT * FROM device_runs WHERE job_id=? ORDER BY started_at", (job_id,))]
+        "SELECT * FROM device_runs WHERE job_id=? "
+        "ORDER BY COALESCE(num, 999), started_at", (job_id,))]
     results = {}
     for r in conn.execute("SELECT * FROM results WHERE job_id=?", (job_id,)):
         d = dict(r)
@@ -314,7 +316,7 @@ def job_to_csv(job):
     w = csv.writer(buf, delimiter=";", lineterminator="\n")
     w.writerow([
         "job_num", "job_id", "created_at", "note",
-        "device", "operator", "ssid", "device_status", "egress_ip",
+        "device", "device_num", "operator", "ssid", "device_status", "egress_ip",
         "egress_operator", "egress_ok", "local_ip",
         "target", "resolved_ip",
         "icmp_sent", "icmp_recv", "loss_pct", "rtt_min_ms", "rtt_avg_ms",
@@ -337,7 +339,8 @@ def job_to_csv(job):
             loss = round(100.0 * (sent - recv) / sent, 1) if sent else ""
             base = [
                 job.get("num"), job.get("id"), created, job.get("note"),
-                device, d.get("operator") or "", d.get("ssid") or "",
+                device, d.get("num") or "", d.get("operator") or "",
+                d.get("ssid") or "",
                 d.get("status") or "", d.get("egress_ip") or "",
                 d.get("egress_info") or "",
                 1 if d.get("egress_ok") else 0, d.get("local_ip") or "",
@@ -679,12 +682,12 @@ class Handler(BaseHTTPRequestHandler):
                             (job_id,)).fetchone() is None:
                 return self._err(404, "задание не найдено")
             conn.execute(
-                "INSERT INTO device_runs (job_id, device, operator, status, ssid, "
-                "bssid, signal, local_ip, gateway, egress_ip, egress_info, "
+                "INSERT INTO device_runs (job_id, device, operator, num, status, "
+                "ssid, bssid, signal, local_ip, gateway, egress_ip, egress_info, "
                 "egress_ok, started_at, finished_at, error) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(job_id, device) DO UPDATE SET "
-                "operator=excluded.operator, "
+                "operator=excluded.operator, num=excluded.num, "
                 "status=excluded.status, ssid=excluded.ssid, bssid=excluded.bssid, "
                 "signal=excluded.signal, local_ip=excluded.local_ip, "
                 "gateway=excluded.gateway, egress_ip=excluded.egress_ip, "
@@ -692,6 +695,7 @@ class Handler(BaseHTTPRequestHandler):
                 "started_at=excluded.started_at, finished_at=excluded.finished_at, "
                 "error=excluded.error",
                 (job_id, device, str(data.get("operator") or "")[:64] or None,
+                 data.get("num"),
                  str(data.get("status") or "done")[:16],
                  data.get("ssid"), data.get("bssid"), data.get("signal"),
                  data.get("local_ip"), data.get("gateway"), data.get("egress_ip"),

@@ -156,8 +156,9 @@ class Client:
                           {"agent_id": agent_id, "version": VERSION,
                            "state": state,
                            "devices": [{"name": d["name"], "ssid": d["ssid"],
-                                        "operator": d.get("operator")}
-                                       for d in devices]})
+                                        "operator": d.get("operator"),
+                                        "num": i + 1}
+                                       for i, d in enumerate(devices)]})
 
     def poll(self, agent_id):
         return self._call("GET", "/api/agent/poll?agent_id=" + agent_id).get("job")
@@ -296,9 +297,9 @@ class Agent:
         buffered = []
         job_error = None
         try:
-            for dev in devices:
+            for i, dev in enumerate(devices):
                 payload = self.run_device(dev, job, targets, ports, icmp_count,
-                                          not_mobile)
+                                          not_mobile, num=i + 1)
                 payload["logs"] = take_logs()
                 try:
                     self.client.send_device(job["id"], payload)
@@ -330,17 +331,19 @@ class Agent:
             log("не удалось закрыть задание: %s" % str(exc)[:100])
         stop_capture()
 
-    def run_device(self, dev, job, targets, ports, icmp_count, not_mobile):
+    def run_device(self, dev, job, targets, ports, icmp_count, not_mobile,
+                   num=None):
         name, ssid = dev["name"], dev["ssid"]
         set_log_device(name)
         started = time.time()
         payload = {"device": name, "ssid": ssid, "operator": dev.get("operator"),
-                   "started_at": started, "status": "error", "results": []}
+                   "num": num, "started_at": started, "status": "error",
+                   "results": []}
 
         try:
             self.client.send_device(job["id"], {
                 "device": name, "ssid": ssid, "operator": dev.get("operator"),
-                "status": "running", "started_at": started,
+                "num": num, "status": "running", "started_at": started,
                 "results": [], "logs": peek_logs()})
         except OSError:
             pass                                  # прогресс не критичен
@@ -536,9 +539,9 @@ def local_run(cfg, targets, ports, device_names=None):
                 "icmp_count": cfg["icmp_count"]}
     rows = []
     try:
-        for dev in devices:
+        for i, dev in enumerate(devices):
             payload = agent.run_device(dev, fake_job, targets, ports,
-                                       cfg["icmp_count"], not_mobile)
+                                       cfg["icmp_count"], not_mobile, num=i + 1)
             rows.append(payload)
     finally:
         agent.go_home()
