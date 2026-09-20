@@ -13,6 +13,7 @@ interfaces`: вывод netsh отдаётся в OEM-кодировке и ло
 import ctypes
 import ctypes.wintypes as wt
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -433,23 +434,53 @@ def delete_profile(profile_name):
     _netsh(["wlan", "delete", "profile", "name=%s" % profile_name])
 
 
-def wait_for_ip(adapter_index, timeout=30, exclude_ip=None):
+def address_usable(ip):
+    """Можно ли реально привязать сокет к этому адресу."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((ip, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def wait_for_ip(adapter_index, timeout=30, exclude_ip=None, stable_for=3.0):
     """
     Дождаться, пока адаптер получит рабочий IPv4 и шлюз.
 
-    exclude_ip — адрес, который был до переключения: пока он не сменился,
-    считаем, что DHCP ещё не отработал.
+    Недостаточно дождаться появления адреса: сразу после ассоциации на
+    адаптере ещё висит адрес от прошлой сессии, затем он на несколько секунд
+    снимается, и только потом DHCP выдаёт настоящий. Замер, начатый в этом
+    промежутке, уходит с несуществующего адреса — bind падает с
+    WSAEADDRNOTAVAIL, а ICMP возвращает 1214, и это выглядит как «цель
+    недоступна», хотя измерения просто не было.
+
+    Поэтому адрес обязан продержаться `stable_for` секунд подряд и пройти
+    проверку bind.
+
+    exclude_ip — адрес до переключения: пока он не сменился, DHCP не отработал.
     """
     import netinfo
     deadline = time.time() + timeout
+    stable_ip, stable_since = None, 0.0
     while time.time() < deadline:
         a = netinfo.by_index(adapter_index)
-        if a and a["ipv4"] and a["gateways"]:
-            ip = a["ipv4"][0]
-            if not ip.startswith("169.254.") and ip != exclude_ip:
+        ip = a["ipv4"][0] if (a and a["ipv4"] and a["gateways"]) else None
+        good = (ip and not ip.startswith("169.254.") and ip != exclude_ip
+                and address_usable(ip))
+        if good:
+            if ip != stable_ip:
+                stable_ip, stable_since = ip, time.time()
+            elif time.time() - stable_since >= stable_for:
                 return a
-        time.sleep(1.0)
-    raise WlanError("адаптер не получил адрес за %d с" % timeout)
+        else:
+            stable_ip, stable_since = None, 0.0
+        time.sleep(0.5)
+
+    raise WlanError("адаптер не получил устойчивый адрес за %d с "
+                    "(последний кандидат: %s)" % (timeout, stable_ip or "нет"))
 
 
 if __name__ == "__main__":

@@ -60,13 +60,39 @@ IP_STATUS = {
 # IP_STATUS, а обычный код Windows. Чаще всего это значит, что с указанного
 # исходного адреса до цели просто нет маршрута — например, телефон раздаёт
 # Wi-Fi, но сам в интернет не выходит.
+SOURCE_INVALID = "исходный адрес недоступен"
+
 WIN32_STATUS = {
     87: "неверный параметр",
-    1214: "нет маршрута с этого интерфейса",
+    # 1214 приходит, когда исходного адреса уже нет на адаптере: Wi-Fi
+    # переподключился и DHCP ещё не выдал новый. Это не «цель недоступна»,
+    # а признак того, что замера не было вовсе.
+    1214: SOURCE_INVALID,
     1231: "сеть недоступна",
     1232: "узел недоступен",
+    10049: SOURCE_INVALID,
     10065: "узел недостижим",
 }
+
+
+def source_usable(src_ip):
+    """Есть ли сейчас такой адрес на машине и можно ли к нему привязаться."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((src_ip, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def result_is_invalid(res):
+    """Замер не состоялся: исходный адрес пропал, а не цель молчит."""
+    if res.get("icmp_status") == SOURCE_INVALID:
+        return True
+    tcp = res.get("tcp") or []
+    return bool(tcp) and all(t.get("error") == SOURCE_INVALID for t in tcp)
 
 
 def _status_text(code):
@@ -203,6 +229,7 @@ def tcp_check(dest_ip, port, src_ip, timeout=3.0):
                  10060: "таймаут",
                  10065: "узел недостижим",
                  10051: "сеть недостижима",
+                 10049: SOURCE_INVALID,
                  10013: "доступ запрещён"}.get(code, msg)
         return {"port": port, "ok": False, "ms": None, "error": str(short)[:80]}
     finally:
@@ -255,18 +282,27 @@ def _http_get(host, path, src_ip, timeout=8, port=80):
         conn.close()
 
 
-def egress_info(src_ip, own_server=None, timeout=8):
+def egress_info(src_ip, own_server=None, timeout=5, budget=20):
     """
     Узнать, с какого внешнего адреса виден трафик, уходящий с src_ip.
 
     Сначала спрашиваем свой сервер (не зависим от чужих сервисов), затем
-    публичные echo-сервисы. Возвращает dict(ip, info) или dict(ip=None,...).
+    публичные echo-сервисы. `budget` ограничивает суммарное время: если за
+    точкой доступа интернета нет вообще, перебирать все запасные варианты
+    бессмысленно — это втрое удлиняет обход телефонов.
+
+    Возвращает dict(ip, info) или dict(ip=None, info="").
     """
+    deadline = time.time() + budget
+
+    def left():
+        return min(timeout, deadline - time.time())
+
     # 1. собственный сервер
-    if own_server:
+    if own_server and left() > 0:
         try:
             host, _, port = own_server.partition(":")
-            body = _http_get(host, "/api/whoami", src_ip, timeout,
+            body = _http_get(host, "/api/whoami", src_ip, left(),
                              int(port) if port else 80)
             if body:
                 ip = json.loads(body).get("ip")
@@ -276,22 +312,25 @@ def egress_info(src_ip, own_server=None, timeout=8):
             pass
 
     # 2. ip-api.com — заодно отдаёт оператора, это полезно в отчёте
-    try:
-        body = _http_get("ip-api.com",
-                         "/json/?fields=query,country,isp,as", src_ip, timeout)
-        if body:
-            d = json.loads(body)
-            if d.get("query"):
-                info = " · ".join(x for x in (d.get("isp"), d.get("country"))
-                                  if x)
-                return {"ip": d["query"], "info": info[:120]}
-    except (OSError, ValueError):
-        pass
-
-    # 3. самый простой запасной вариант
-    for host, path in (("ifconfig.me", "/ip"), ("api.ipify.org", "/")):
+    if left() > 0:
         try:
-            body = _http_get(host, path, src_ip, timeout)
+            body = _http_get("ip-api.com", "/json/?fields=query,country,isp,as",
+                             src_ip, left())
+            if body:
+                d = json.loads(body)
+                if d.get("query"):
+                    info = " · ".join(x for x in (d.get("isp"), d.get("country"))
+                                      if x)
+                    return {"ip": d["query"], "info": info[:120]}
+        except (OSError, ValueError):
+            pass
+
+    # 3. самые простые запасные варианты
+    for host, path in (("ifconfig.me", "/ip"), ("api.ipify.org", "/")):
+        if left() <= 0:
+            break
+        try:
+            body = _http_get(host, path, src_ip, left())
             if body and len(body) < 60:
                 return {"ip": body.strip(), "info": ""}
         except OSError:

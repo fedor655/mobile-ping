@@ -334,9 +334,36 @@ class Agent:
         else:
             log("  внешний IP определить не удалось (сеть режет доступ наружу)")
 
+        # Адрес мог смениться, пока мы ходили за внешним IP. Замер с исчезнувшего
+        # адреса молча превращается в «цель недоступна», поэтому проверяем.
+        if not probe.source_usable(src_ip):
+            fresh = netinfo.by_index(self.adapter["index"])
+            new_ip = fresh["ipv4"][0] if fresh and fresh["ipv4"] else None
+            if new_ip and probe.source_usable(new_ip):
+                log("  адрес сменился %s -> %s, продолжаю" % (src_ip, new_ip))
+                src_ip = new_ip
+                payload["local_ip"] = new_ip
+            else:
+                payload.update(status="error", finished_at=time.time(),
+                               error="исходный адрес пропал до начала замера — "
+                                     "замер недействителен")
+                log("  адрес %s исчез с адаптера, замер отменён" % src_ip)
+                return payload
+
         payload["results"] = measure(
             targets, src_ip, ports, icmp_count, self.cfg["icmp_timeout_ms"],
             self.cfg["tcp_timeout"], self.cfg["parallel"])
+
+        # Если замер развалился из-за исходного адреса, это сбой устройства, а
+        # не приговор целям: показывать такое как «не отвечает» нельзя.
+        invalid = [r for r in payload["results"] if probe.result_is_invalid(r)]
+        if invalid and len(invalid) == len(payload["results"]):
+            payload.update(status="error", finished_at=time.time(),
+                           error="замер недействителен: исходный адрес %s "
+                                 "пропал с адаптера" % src_ip)
+            log("  ВНИМАНИЕ: замер недействителен, адрес %s пропал" % src_ip)
+            return payload
+
         payload["status"] = "done"
         payload["finished_at"] = time.time()
 
