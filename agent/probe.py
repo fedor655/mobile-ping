@@ -68,6 +68,26 @@ SOURCE_INVALID = "исходный адрес недоступен"
 # Порты, на которых осмысленно пробовать TLS-рукопожатие.
 TLS_PORTS = (443, 8443, 993, 995, 465)
 
+
+def _make_tls_context():
+    """
+    Контекст для рукопожатия, создаётся один раз на процесс.
+
+    Проверка подлинности сертификата выключена намеренно: мы выясняем, дают ли
+    нам вообще завершить рукопожатие, а не доверяем ли мы собеседнику.
+    Из-за этого не нужно и хранилище сертификатов — а именно его загрузка в
+    ssl.create_default_context() стоит 23 мс на вызов под Windows и держит
+    GIL. Пока контекст создавался на каждую проверку, TLS упирался в 42
+    проверки в секунду на любом канале, хоть на мобильном, хоть на проводе.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+_TLS_CTX = _make_tls_context()
+
 WIN32_STATUS = {
     87: "неверный параметр",
     # 1214 приходит, когда исходного адреса уже нет на адаптере: Wi-Fi
@@ -255,11 +275,9 @@ def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None):
                "ms": (time.perf_counter() - t0) * 1000.0, "error": None}
 
         if server_hostname and port in TLS_PORTS:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False          # проверяем доступность, не доверие
-            ctx.verify_mode = ssl.CERT_NONE
             try:
-                with ctx.wrap_socket(s, server_hostname=server_hostname) as tls:
+                with _TLS_CTX.wrap_socket(s,
+                                          server_hostname=server_hostname) as tls:
                     res["tls"] = True
                     res["tls_proto"] = tls.version()
             except ssl.SSLError as exc:
