@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API — mobile-ping</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <a href="/" class="back">← к списку</a>
+  <h1>API</h1>
+  <span class="spacer"></span>
+  <span class="sub">(всё отдаётся в UTF-8, тела запросов — JSON)</span>
+</header>
+
+<div class="card">
+  <h2>Как это работает</h2>
+  <p class="doc">
+    Проверка создаётся одним запросом и выполняется асинхронно: агент на
+    домашнем ноутбуке забирает её из очереди, по очереди обходит телефоны и
+    присылает результаты. Поэтому <code>POST /api/jobs</code> возвращается
+    сразу, а результат нужно забирать по идентификатору.
+  </p>
+  <p class="doc">
+    Обход двух телефонов занимает примерно полторы минуты. Опрашивать чаще
+    раза в 2–3 секунды смысла нет.
+  </p>
+</div>
+
+<div class="card">
+  <h2>Публичные ручки</h2>
+
+  <div class="ep">
+    <div class="epl"><span class="m post">POST</span><code>/api/jobs</code></div>
+    <p class="doc">Создать проверку. Возвращает <code>201</code> и номер.</p>
+<pre>curl -X POST __ORIGIN__/api/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "targets": "facebook.com\nya.ru\n1.2.3.4:8443",
+    "ports": "443,80",
+    "icmp_count": 4,
+    "note": "зачем проверяли",
+    "devices": null
+  }'
+
+{"job_id": "3b87409cca8c", "num": 7, "url": "/j/3b87409cca8c"}</pre>
+    <table class="params">
+      <tr><td><code>targets</code></td><td>строка с переносами или массив.
+        Допустимо <code>1.2.3.4</code>, <code>example.com</code>,
+        <code>host:port</code>, ссылка (возьмётся только хост). До 100 штук.
+        <b>Обязательное.</b></td></tr>
+      <tr><td><code>ports</code></td><td>TCP-порты через запятую, до 6.
+        По умолчанию <code>443,80</code>. Порт, указанный прямо в цели,
+        заменяет этот список для неё.</td></tr>
+      <tr><td><code>icmp_count</code></td><td>пакетов на цель, 1–10,
+        по умолчанию 4.</td></tr>
+      <tr><td><code>note</code></td><td>произвольная пометка, до 200 символов.</td></tr>
+      <tr><td><code>devices</code></td><td>массив имён устройств или
+        <code>null</code> — использовать все.</td></tr>
+    </table>
+  </div>
+
+  <div class="ep">
+    <div class="epl"><span class="m get">GET</span><code>/api/jobs/&lt;id&gt;</code></div>
+    <p class="doc">
+      Состояние и результаты. Поле <code>status</code>:
+      <code>queued</code> → <code>running</code> → <code>done</code>
+      либо <code>failed</code>. Пока идёт работа, заполненные устройства уже
+      видны — можно показывать прогресс.
+    </p>
+<pre>{
+  "id": "3b87409cca8c", "num": 7, "status": "done",
+  "created_at": 1789883000.1, "finished_at": 1789883086.4,
+  "targets": ["facebook.com", "ya.ru"], "ports": [443, 80],
+  "devices": [
+    {"device": "билайн №1", "operator": "билайн", "ssid": "i",
+     "status": "done", "signal": "93%",
+     "local_ip": "10.188.76.97",      // выдал телефон по DHCP
+     "egress_ip": "81.9.73.12",       // как нас видят снаружи
+     "egress_info": "PJSC Vimpelcom · Russia",
+     "egress_ok": 1,                  // 0 = мобильный выход НЕ подтверждён
+     "started_at": 1789883001.0, "finished_at": 1789883021.0, "error": null}
+  ],
+  "results": {
+    "билайн №1": {
+      "facebook.com": {
+        "resolved_ip": "57.144.248.1",
+        "icmp_sent": 4, "icmp_recv": 4,
+        "rtt_min": 170.0, "rtt_avg": 182.0, "rtt_max": 201.0,
+        "icmp_status": "ok",
+        "tcp": [
+          {"port": 443, "ok": true, "ms": 117.0,
+           "tls": false, "tls_error": "TLS без ответа (молча режут)"},
+          {"port": 80, "ok": true, "ms": 137.0}
+        ],
+        "error": null
+      }
+    }
+  },
+  "logs": [{"ts": 1789883001.0, "device": "билайн №1", "text": "подключён…"}]
+}</pre>
+    <p class="doc">
+      <b>Главное поле — <code>tls</code>.</b> Российский DPI обычно пропускает
+      TCP-соединение и рвёт его уже на ClientHello, поэтому
+      <code>"ok": true</code> у порта 443 сам по себе ничего не доказывает.
+      Блокировка — это <code>tls: false</code> при открывшемся TCP.
+    </p>
+    <p class="doc">
+      <code>egress_ok: 0</code> означает, что агент не смог подтвердить выход
+      через мобильную сеть. Такие цифры нельзя выдавать за замер с оператора.
+    </p>
+  </div>
+
+  <div class="ep">
+    <div class="epl"><span class="m get">GET</span>
+      <code>/api/jobs/&lt;id&gt;/export.csv</code></div>
+    <p class="doc">
+      Та же проверка плоской таблицей: одна строка на
+      (устройство, цель, порт), разделитель <code>;</code>, UTF-8 с BOM.
+      Длинный формат выбран намеренно — читается pandas и Excel без подготовки,
+      колонки не разъезжаются при смене числа портов.
+    </p>
+<pre>import pandas as pd
+df = pd.read_csv("__ORIGIN__/api/jobs/&lt;id&gt;/export.csv", sep=";")
+df[df.verdict == "blocked"][["device", "target", "tls_error"]]</pre>
+    <p class="doc">
+      Колонка <code>verdict</code> — готовый итог по цели:
+      <code>ok</code> · <code>blocked</code> (TCP открыт, TLS сорван) ·
+      <code>no_icmp</code> (жив по TCP, но режет ping) ·
+      <code>icmp_only</code> · <code>down</code> · <code>error</code>.
+    </p>
+  </div>
+
+  <div class="ep">
+    <div class="epl"><span class="m get">GET</span><code>/api/jobs</code></div>
+    <p class="doc">Последние 50 проверок: номер, время, статус, цели.</p>
+  </div>
+
+  <div class="ep">
+    <div class="epl"><span class="m get">GET</span><code>/api/agents</code></div>
+    <p class="doc">
+      Агенты и их устройства — отсюда берутся имена для поля
+      <code>devices</code>. <code>online</code> означает, что агент отмечался
+      в последние две минуты.
+    </p>
+  </div>
+
+  <div class="ep">
+    <div class="epl"><span class="m get">GET</span><code>/api/whoami</code></div>
+    <p class="doc">Внешний IP того, кто спрашивает. Этим агент и проверяет,
+      что замер уходит через мобильную сеть.</p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Ручки агента</h2>
+  <p class="doc">
+    Требуют заголовок <code>Authorization: Bearer &lt;токен&gt;</code>
+    (лежит на сервере в <code>/etc/mobile-ping.env</code>). Нужны только
+    самому агенту — для получения результатов они не требуются.
+  </p>
+  <table class="params">
+    <tr><td><span class="m get">GET</span> <code>/api/agent/poll?agent_id=…</code></td>
+      <td>взять задание из очереди; отдаётся не более одного раза</td></tr>
+    <tr><td><span class="m post">POST</span> <code>/api/agent/hello</code></td>
+      <td>отметиться и сообщить список устройств</td></tr>
+    <tr><td><span class="m post">POST</span> <code>/api/agent/jobs/&lt;id&gt;/device</code></td>
+      <td>результаты одного телефона и строки журнала</td></tr>
+    <tr><td><span class="m post">POST</span> <code>/api/agent/jobs/&lt;id&gt;/complete</code></td>
+      <td>закрыть задание</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Ошибки</h2>
+  <p class="doc">
+    Неуспех — это код <code>4xx</code>/<code>5xx</code> и тело
+    <code>{"error": "по-русски, что не так"}</code>. Разбирать текст не нужно,
+    он для человека.
+  </p>
+  <table class="params">
+    <tr><td><code>400</code></td><td>кривой адрес, порт не число, целей нет</td></tr>
+    <tr><td><code>401</code></td><td>нет или неверен токен агента</td></tr>
+    <tr><td><code>404</code></td><td>такой проверки нет</td></tr>
+  </table>
+  <p class="doc">
+    Отдельно: задание может завершиться со <code>status: "failed"</code> —
+    это не ошибка HTTP, а результат. Например, агент не отвечал 30 минут.
+  </p>
+</div>
+
+</div>
+
+<script>
+// В репозитории примеры хранятся с заглушкой, а на живой странице она
+// заменяется на адрес, по которому эта страница открыта.
+document.body.innerHTML = document.body.innerHTML
+  .split('__ORIGIN__').join(location.origin);
+</script>
+</body>
+</html>

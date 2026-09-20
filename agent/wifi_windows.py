@@ -392,9 +392,7 @@ def connect(ssid, interface_name, profile_name=None, timeout=45,
         if time.time() >= deadline:
             break
 
-    where = (last or {}).get("ssid") or (last or {}).get("state") or "неизвестно"
-    raise WlanError("не подключились к %r за %d с (адаптер сейчас: %s)"
-                    % (ssid, timeout, where))
+    raise WlanError("не подключились к %r за %d с" % (ssid, timeout))
 
 
 def join(ssid, interface_name, password=None, is_open=False, timeout=45,

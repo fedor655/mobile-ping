@@ -3,16 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Проверка — mobile-ping</title>
+<title>mobile-ping</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <div class="wrap">
 
 <header class="top">
-  <h1>Проверка <span class="mono" id="jid"></span></h1>
+  <a href="/" class="back">← к списку</a>
+  <h1 id="title">№…</h1>
   <span id="st"></span>
-  <a href="/">← к списку</a>
+  <span class="sub" id="took"></span>
+  <span class="spacer"></span>
+  <a id="csv" href="#" class="btnlink">CSV</a>
+  <a id="jsonl" href="#" class="btnlink">JSON</a>
 </header>
 
 <div id="warn"></div>
@@ -26,66 +30,120 @@
   <h2>Результаты</h2>
   <div id="matrix"><span class="empty">загрузка…</span></div>
   <p class="tiny" style="margin-top:14px">
-    В ячейке: доля дошедших ICMP-пакетов и средний RTT, ниже — TCP-порты.
-    <b class="cell-ok">Зелёное</b> — отвечает, <b class="cell-bad">красное</b> — нет,
-    <b class="cell-mid">жёлтое</b> — ICMP молчит, но TCP открыт (частый случай:
-    хост жив, но режет ping).
+    Зелёное — отвечает; красное — нет; жёлтое — ICMP молчит, но TCP открыт.<br>
+    Для доменов на порту 443 делается настоящее TLS-рукопожатие с SNI.
   </p>
+</div>
+
+<div class="card">
+  <h2>Журнал агента <span class="tiny" id="logcount"></span></h2>
+  <div class="logbox" id="logs"><span class="empty">пока пусто</span></div>
+  <label class="logfoot">
+    <input type="checkbox" id="follow" checked> следить за концом
+  </label>
 </div>
 
 </div>
 <script src="/static/common.js"></script>
 <script>
 const jobId = location.pathname.split('/').filter(Boolean).pop();
-document.getElementById('jid').textContent = jobId;
 let timer = null;
+
+// Короткая причина отказа TLS: в ячейке нет места на полную формулировку,
+// а разбираться человек всё равно будет по журналу.
+function tlsShort(err) {
+  const e = String(err || '');
+  if (/без ответа/i.test(e)) return 'нет ответа';
+  if (/сброшен/i.test(e)) return 'сброс';
+  if (/отвергнут/i.test(e)) return 'отказ';
+  return e.replace(/^TLS[: ]*/i, '') || 'не прошёл';
+}
+
+function kv(label, value, cls) {
+  return '<span class="k">' + label + '</span>' +
+         '<span class="' + (cls || '') + '">' + value + '</span>';
+}
 
 function cellHTML(r) {
   if (!r) return '<span class="cell-na">—</span>';
-  if (r.error) return '<span class="cell-bad">ошибка</span>' +
-                      '<div class="tiny">' + esc(r.error) + '</div>';
+  if (r.error)
+    return '<div class="kv">' + kv('сбой', esc(r.error), 'cell-bad') + '</div>';
 
   const sent = r.icmp_sent || 0, recv = r.icmp_recv || 0;
   const icmpOk = recv > 0;
   const tcp = r.tcp || [];
   const tcpOk = tcp.some(t => t.ok);
-  const cls = icmpOk ? 'cell-ok' : (tcpOk ? 'cell-mid' : 'cell-bad');
+  // TLS главнее остального: DPI пропускает TCP и рвёт ClientHello, поэтому
+  // «порт открыт» при сорванном рукопожатии означает блокировку.
+  const tlsTried = tcp.filter(t => t.tls !== undefined && t.tls !== null);
+  const blocked = tlsTried.length > 0 && tlsTried.every(t => !t.tls);
 
-  let h = '<span class="' + cls + '"><b>';
-  h += icmpOk ? (recv + '/' + sent) : (sent ? '0/' + sent : '—');
-  if (icmpOk && r.rtt_avg != null) h += ' · ' + Math.round(r.rtt_avg) + ' мс';
-  h += '</b></span>';
+  let h = '<div class="kv">';
 
-  if (!icmpOk && r.icmp_status)
-    h += '<div class="tiny">' + esc(r.icmp_status) + '</div>';
-
-  if (tcp.length) {
-    const parts = tcp.map(t => '<span class="' + (t.ok ? 'cell-ok' : 'cell-bad') +
-      '">' + t.port + (t.ok && t.ms != null ? ' ' + Math.round(t.ms) + 'мс' : '') +
-      '</span>');
-    h += '<div class="tiny">TCP ' + parts.join(' ') + '</div>';
+  // ICMP: сколько дошло и за сколько
+  if (sent) {
+    h += kv('ICMP', (icmpOk ? recv + '/' + sent : '0/' + sent) +
+            (icmpOk && r.rtt_avg != null ? ' · ' + Math.round(r.rtt_avg) + ' мс' : ''),
+            icmpOk ? 'cell-ok' : 'cell-bad');
+    if (!icmpOk && r.icmp_status && r.icmp_status !== 'таймаут')
+      h += kv('', '<span class="tiny">' + esc(r.icmp_status) + '</span>', '');
   }
-  if (r.resolved_ip && r.resolved_ip !== r.target)
-    h += '<div class="tiny">' + esc(r.resolved_ip) + '</div>';
+
+  // TCP: какие порты открылись и насколько быстро
+  if (tcp.length) {
+    const parts = tcp.map(t =>
+      '<span class="' + (t.ok ? 'cell-ok' : 'cell-bad') + '">' + t.port +
+      (t.ok && t.ms != null ? '<span class="tiny"> ' + Math.round(t.ms) + '</span>' : '') +
+      '</span>');
+    h += kv('TCP', parts.join(' · '), '');
+  }
+
+  // TLS: собственно вердикт о блокировке
+  if (tlsTried.length) {
+    const good = tlsTried.find(t => t.tls);
+    h += good
+      ? kv('TLS', esc(good.tls_proto || 'ок'), 'cell-ok')
+      : kv('TLS', esc(tlsShort(tlsTried[0].tls_error)) +
+           ' · <b>похоже на блокировку</b>', 'cell-bad');
+  }
+
+  if (r.resolved_ip)
+    h += kv('IP', '<span class="mono tiny">' + esc(r.resolved_ip) + '</span>', '');
+
+  return h + '</div>';
+}
+
+function deviceLabel(d, i) {
+  // №1 "i" билайн — номер, имя точки, оператор. Всё одинаково читаемо.
+  let h = '<b>№' + (i + 1) + '</b>';
+  if (d.ssid) h += ' <span class="ssid">«' + esc(d.ssid) + '»</span>';
+  const op = d.operator || d.device;
+  if (op) h += ' <span class="op">' + esc(op) + '</span>';
   return h;
 }
 
 function render(job) {
+  document.getElementById('title').textContent = '№' + (job.num || '—');
+  document.title = '№' + (job.num || '') + ' — mobile-ping';
   document.getElementById('st').innerHTML =
     '<span class="pill ' + esc(job.status) + '">' + statusRu(job.status) + '</span>';
+  document.getElementById('csv').href = '/api/jobs/' + jobId + '/export.csv';
+  document.getElementById('jsonl').href = '/api/jobs/' + jobId;
+
+  const end = job.finished_at || (job.status === 'running' ? Date.now() / 1000 : null);
+  document.getElementById('took').textContent = end
+    ? 'заняла ' + fmtDur(job.created_at, end) : '';
 
   const warn = document.getElementById('warn');
   let w = '';
   if (job.status === 'queued')
-    w = 'Задание в очереди — ждём, когда агент его заберёт. ' +
-        'Если агент не запущен, оно будет ждать.';
+    w = 'Задание в очереди — ждём, когда агент его заберёт.';
   if (job.error) w = 'Ошибка: ' + esc(job.error);
   const bad = (job.devices || []).filter(d => d.status === 'done' && !d.egress_ok);
   if (bad.length)
     w += (w ? '<br>' : '') + 'Внимание: у устройств ' +
-      bad.map(d => esc(d.device)).join(', ') +
-      ' не подтверждён выход через мобильную сеть — результаты могут быть ' +
-      'сняты не с того канала.';
+      bad.map(d => '"' + esc(d.operator || d.device) + '"').join(', ') +
+      ' не подтверждён выход через мобильную сеть';
   warn.innerHTML = w ? '<div class="banner">' + w + '</div>' : '';
 
   // --- устройства ---
@@ -94,52 +152,92 @@ function render(job) {
   if (!devs.length) {
     dbox.innerHTML = '<span class="empty">агент ещё не начал</span>';
   } else {
-    let h = '<table><thead><tr><th>Устройство</th><th>Статус</th><th>SSID</th>' +
-            '<th>Сигнал</th><th class="mono">IP в сети</th>' +
-            '<th class="mono">Внешний IP</th><th>Оператор</th><th>Время</th>' +
-            '</tr></thead><tbody>';
-    for (const d of devs) {
-      h += '<tr><td><b>' + esc(d.device) + '</b></td>' +
+    let h = '<table><thead><tr><th>Устройство</th><th>Статус</th>' +
+            '<th>Сигнал</th>' +
+            '<th class="mono" title="адрес, который выдал телефон по DHCP">' +
+              'IP от точки</th>' +
+            '<th class="mono" title="как нас видят снаружи — по нему и ' +
+              'подтверждается, что выход мобильный">IP в интернете</th>' +
+            '<th>Оператор связи</th><th>Время</th></tr></thead><tbody>';
+    let total = 0;
+    devs.forEach((d, i) => {
+      if (d.started_at && d.finished_at) total += d.finished_at - d.started_at;
+      h += '<tr><td>' + deviceLabel(d, i) + '</td>' +
         '<td><span class="pill ' + (d.status === 'done' ? 'done' :
              d.status === 'running' ? 'running' : 'failed') + '">' +
              statusRu(d.status) + '</span>' +
              (d.error ? '<div class="tiny">' + esc(d.error) + '</div>' : '') + '</td>' +
-        '<td>' + esc(d.ssid || '—') + '</td>' +
         '<td>' + esc(d.signal || '—') + '</td>' +
         '<td class="mono">' + esc(d.local_ip || '—') + '</td>' +
         '<td class="mono">' + (d.egress_ip
             ? '<span class="' + (d.egress_ok ? 'cell-ok' : 'cell-bad') + '">' +
               esc(d.egress_ip) + '</span>'
             : '<span class="cell-na">—</span>') + '</td>' +
-        '<td class="tiny">' + esc(d.egress_info || '') + '</td>' +
-        '<td class="tiny">' + fmtDur(d.started_at, d.finished_at) + '</td></tr>';
-    }
+        '<td>' + esc(d.egress_info || '—') + '</td>' +
+        '<td>' + (d.started_at && d.finished_at
+                  ? fmtDur(d.started_at, d.finished_at) : '—') + '</td></tr>';
+    });
+    h += '<tr class="totals"><td colspan="6">Итого по устройствам</td><td>' +
+         fmtSec(total) + '</td></tr>';
     dbox.innerHTML = h + '</tbody></table>';
   }
 
   // --- матрица ---
-  const names = devs.map(d => d.device);
   const mbox = document.getElementById('matrix');
-  if (!names.length) {
+  if (!devs.length) {
     mbox.innerHTML = '<span class="empty">результатов пока нет</span>';
     return;
   }
   let h = '<table class="matrix"><thead><tr><th>Цель</th>';
-  for (const n of names) h += '<th>' + esc(n) + '</th>';
+  devs.forEach((d, i) => { h += '<th>' + deviceLabel(d, i) + '</th>'; });
   h += '</tr></thead><tbody>';
   for (const t of job.targets) {
     h += '<tr><td class="t">' + esc(t) + '</td>';
-    for (const n of names)
-      h += '<td>' + cellHTML(((job.results || {})[n] || {})[t]) + '</td>';
+    for (const d of devs)
+      h += '<td>' + cellHTML(((job.results || {})[d.device] || {})[t]) + '</td>';
     h += '</tr>';
   }
   mbox.innerHTML = h + '</tbody></table>';
+}
+
+let lastLogCount = -1;
+
+function renderLogs(logs) {
+  const box = document.getElementById('logs');
+  document.getElementById('logcount').textContent =
+    logs.length ? '— ' + logs.length + ' строк, весь целиком' : '';
+  if (!logs.length) {
+    box.innerHTML = '<span class="empty">агент ещё ничего не написал</span>';
+    return;
+  }
+  if (logs.length === lastLogCount) return;   // не перерисовывать зря
+  lastLogCount = logs.length;
+
+  const atEnd = document.getElementById('follow').checked;
+  let h = '';
+  for (const l of logs) {
+    const t = String(l.text || '');
+    // подсветка по смыслу строки: уровней агент не заводит
+    let cls = '';
+    if (/ВНИМАНИЕ|не удалось|не подключ|ошибк|отменён|недействител|исчез/i.test(t))
+      cls = 'cell-bad';
+    else if (/подтверждена|готово|завершено|подключён/i.test(t))
+      cls = 'cell-ok';
+    else if (/определить не удалось|придержу|сменил/i.test(t))
+      cls = 'cell-mid';
+    h += '<div class="logline"><span class="logts">' + fmtTime(l.ts) + '</span>' +
+         (l.device ? '<span class="logdev">' + esc(l.device) + '</span>' : '') +
+         '<span class="' + cls + '">' + esc(t) + '</span></div>';
+  }
+  box.innerHTML = h;
+  if (atEnd) box.scrollTop = box.scrollHeight;
 }
 
 async function tick() {
   try {
     const job = await getJSON('/api/jobs/' + encodeURIComponent(jobId));
     render(job);
+    renderLogs(job.logs || []);
     if (job.status === 'done' || job.status === 'failed') {
       if (timer) { clearInterval(timer); timer = null; }
     }

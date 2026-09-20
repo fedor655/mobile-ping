@@ -58,6 +58,13 @@ DEFAULTS = {
 }
 
 
+# Пока выполняется задание, строки журнала копятся здесь и уезжают на сервер
+# вместе с результатами: по одной таблице нельзя понять, почему цель молчала,
+# а по журналу видно, дошёл ли агент до неё вообще.
+_capture = None
+_device = None
+
+
 def log(msg):
     line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line, flush=True)
@@ -66,6 +73,38 @@ def log(msg):
             fh.write(line + "\n")
     except OSError:
         pass
+    if _capture is not None:
+        _capture.append({"ts": time.time(), "device": _device, "text": msg})
+
+
+def start_capture():
+    global _capture, _device
+    _capture, _device = [], None
+
+
+def stop_capture():
+    global _capture, _device
+    _capture, _device = None, None
+
+
+def take_logs():
+    """Забрать накопленное и очистить буфер."""
+    global _capture
+    if _capture is None:
+        return []
+    out, _capture = _capture, []
+    return out
+
+
+def peek_logs():
+    """Копия накопленного, без очистки: сервер отбрасывает дубли по тексту,
+    поэтому промежуточные отправки безопасны и журнал виден по ходу дела."""
+    return list(_capture) if _capture is not None else []
+
+
+def set_log_device(name):
+    global _device
+    _device = name
 
 
 def load_config(path=CONFIG_PATH):
@@ -116,7 +155,8 @@ class Client:
         return self._call("POST", "/api/agent/hello",
                           {"agent_id": agent_id, "version": VERSION,
                            "state": state,
-                           "devices": [{"name": d["name"], "ssid": d["ssid"]}
+                           "devices": [{"name": d["name"], "ssid": d["ssid"],
+                                        "operator": d.get("operator")}
                                        for d in devices]})
 
     def poll(self, agent_id):
@@ -125,9 +165,9 @@ class Client:
     def send_device(self, job_id, payload):
         return self._call("POST", "/api/agent/jobs/%s/device" % job_id, payload)
 
-    def complete(self, job_id, error=None):
+    def complete(self, job_id, error=None, logs=None):
         return self._call("POST", "/api/agent/jobs/%s/complete" % job_id,
-                          {"error": error})
+                          {"error": error, "logs": logs or []})
 
 
 # --------------------------------------------------------------------------
@@ -160,11 +200,18 @@ class Agent:
         log("Wi-Fi адаптер: %s (idx=%d, %s)"
             % (self.adapter_name, self.adapter["index"], self.adapter_desc))
 
-        tunnels = netinfo.routing_tunnels()
-        if tunnels:
-            log("внимание: подняты туннели — %s. Замеры привязываются к Wi-Fi, "
-                "но внешний IP каждого устройства всё равно будет проверен."
-                % ", ".join(t["name"] for t in tunnels))
+        bad = netinfo.capturing_tunnels()
+        if bad:
+            log("ВНИМАНИЕ: поднят полнотуннельный VPN — %s. Его маршруты "
+                "перехватывают трафик раньше привязки к Wi-Fi, и замеры уйдут "
+                "через него, а не через телефон. Отключите его, иначе каждое "
+                "устройство будет отбраковано по внешнему адресу."
+                % ", ".join(t["name"] for t in bad))
+        other = [t for t in netinfo.routing_tunnels() if t not in bad]
+        if other:
+            log("подняты туннели %s — на замеры они не влияют, но внешний IP "
+                "каждого устройства всё равно проверяется."
+                % ", ".join(t["name"] for t in other))
 
     # -- сеть -----------------------------------------------------------
 
@@ -233,6 +280,7 @@ class Agent:
         devices = [d for d in self.cfg["devices"]
                    if not wanted or d["name"] in wanted]
 
+        start_capture()
         log("задание %s: %d целей, %d устройств, порты %s"
             % (job["id"], len(targets), len(devices), ports))
         if not devices:
@@ -251,6 +299,7 @@ class Agent:
             for dev in devices:
                 payload = self.run_device(dev, job, targets, ports, icmp_count,
                                           not_mobile)
+                payload["logs"] = take_logs()
                 try:
                     self.client.send_device(job["id"], payload)
                 except OSError as exc:
@@ -262,6 +311,7 @@ class Agent:
             log("задание прервано: %s" % job_error)
             log(traceback.format_exc())
         finally:
+            set_log_device(None)
             self.go_home()
 
         for payload in buffered:
@@ -273,22 +323,25 @@ class Agent:
                     % (payload["device"], str(exc)[:100]))
                 job_error = job_error or "часть результатов не доставлена"
 
+        log("задание %s завершено" % job["id"])
         try:
-            self.client.complete(job["id"], error=job_error)
+            self.client.complete(job["id"], error=job_error, logs=take_logs())
         except OSError as exc:
             log("не удалось закрыть задание: %s" % str(exc)[:100])
-        log("задание %s завершено" % job["id"])
+        stop_capture()
 
     def run_device(self, dev, job, targets, ports, icmp_count, not_mobile):
         name, ssid = dev["name"], dev["ssid"]
+        set_log_device(name)
         started = time.time()
-        payload = {"device": name, "ssid": ssid, "started_at": started,
-                   "status": "error", "results": []}
+        payload = {"device": name, "ssid": ssid, "operator": dev.get("operator"),
+                   "started_at": started, "status": "error", "results": []}
 
         try:
             self.client.send_device(job["id"], {
-                "device": name, "ssid": ssid, "status": "running",
-                "started_at": started, "results": []})
+                "device": name, "ssid": ssid, "operator": dev.get("operator"),
+                "status": "running", "started_at": started,
+                "results": [], "logs": peek_logs()})
         except OSError:
             pass                                  # прогресс не критичен
 
@@ -322,17 +375,40 @@ class Agent:
             % (src_ip, gw, payload["signal"]))
 
         eg = probe.egress_info(src_ip, own_server=self.server_host())
-        payload["egress_ip"] = eg.get("ip")
+        egress_ip = eg.get("ip")
+        payload["egress_ip"] = egress_ip
         payload["egress_info"] = eg.get("info")
-        payload["egress_ok"] = bool(eg.get("ip") and eg["ip"] not in not_mobile)
+
+        # Мобильный выход считается подтверждённым, только если внешний адрес
+        # публичный и не совпадает с обычной сетью. Приватный адрес означает,
+        # что запрос пришёл на сервер из туннеля: на машине поднят VPN с
+        # маршрутами 0.0.0.0/1, и он перехватывает трафик раньше, чем
+        # сработает привязка к адресу Wi-Fi. Такие замеры недействительны —
+        # именно так «заблокированный» сайт оказывается доступным.
+        payload["egress_ok"] = bool(
+            egress_ip and probe.is_public_ip(egress_ip)
+            and egress_ip not in not_mobile)
+
         if payload["egress_ok"]:
             log("  внешний IP %s (%s) — мобильная сеть подтверждена"
-                % (eg["ip"], eg.get("info") or "оператор неизвестен"))
-        elif eg.get("ip"):
-            log("  ВНИМАНИЕ: внешний IP %s совпадает с обычной сетью — "
-                "трафик идёт не через телефон" % eg["ip"])
+                % (egress_ip, eg.get("info") or "оператор неизвестен"))
+        elif egress_ip and not probe.is_public_ip(egress_ip):
+            payload.update(status="error", finished_at=time.time(),
+                           error="трафик ушёл в туннель, а не через телефон: "
+                                 "внешний адрес %s приватный. Отключите VPN на "
+                                 "машине агента." % egress_ip)
+            log("  ВНИМАНИЕ: внешний адрес %s приватный — трафик перехвачен "
+                "туннелем, замер отменён" % egress_ip)
+            return payload
+        elif egress_ip:
+            payload.update(status="error", finished_at=time.time(),
+                           error="внешний IP %s совпадает с обычной сетью — "
+                                 "замер шёл не через телефон" % egress_ip)
+            log("  ВНИМАНИЕ: внешний IP %s совпадает с обычной сетью, "
+                "замер отменён" % egress_ip)
+            return payload
         else:
-            log("  внешний IP определить не удалось (сеть режет доступ наружу)")
+            log("  внешний IP определить не удалось — за точкой нет интернета")
 
         # Адрес мог смениться, пока мы ходили за внешним IP. Замер с исчезнувшего
         # адреса молча превращается в «цель недоступна», поэтому проверяем.

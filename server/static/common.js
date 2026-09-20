@@ -30,10 +30,14 @@ function fmtTime(ts) {
          p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
+function fmtSec(s) {
+  s = Math.max(0, Math.round(s));
+  return s < 60 ? s + ' с' : Math.floor(s / 60) + ' м ' + (s % 60) + ' с';
+}
+
 function fmtDur(a, b) {
   if (!a || !b) return '';
-  const s = Math.max(0, Math.round(b - a));
-  return s < 60 ? s + ' с' : Math.floor(s / 60) + ' м ' + (s % 60) + ' с';
+  return fmtSec(b - a);
 }
 
 function statusRu(s) {

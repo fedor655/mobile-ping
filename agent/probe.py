@@ -23,7 +23,9 @@ import ctypes
 import ctypes.wintypes as wt
 import http.client
 import json
+import ipaddress
 import socket
+import ssl
 import struct
 import time
 
@@ -62,6 +64,9 @@ IP_STATUS = {
 # Wi-Fi, но сам в интернет не выходит.
 SOURCE_INVALID = "исходный адрес недоступен"
 
+# Порты, на которых осмысленно пробовать TLS-рукопожатие.
+TLS_PORTS = (443, 8443, 993, 995, 465)
+
 WIN32_STATUS = {
     87: "неверный параметр",
     # 1214 приходит, когда исходного адреса уже нет на адаптере: Wi-Fi
@@ -73,6 +78,24 @@ WIN32_STATUS = {
     10049: SOURCE_INVALID,
     10065: "узел недостижим",
 }
+
+
+def is_public_ip(ip):
+    """
+    Публичный ли адрес. Нужен для проверки мобильного выхода: если наш внешний
+    IP оказался приватным (10.x, 192.168.x, CGNAT 100.64/10), значит запрос
+    пришёл на сервер не из интернета, а из туннеля — замер идёт не туда.
+    """
+    if not ip:
+        return False
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if a in ipaddress.ip_network("100.64.0.0/10"):    # CGNAT, тоже не интернет
+        return False
+    return not (a.is_private or a.is_loopback or a.is_link_local
+                or a.is_reserved or a.is_multicast)
 
 
 def source_usable(src_ip):
@@ -210,16 +233,47 @@ def icmp_ping(dest_ip, src_ip, count=4, timeout_ms=2000, payload=32,
     }
 
 
-def tcp_check(dest_ip, port, src_ip, timeout=3.0):
-    """TCP-рукопожатие с привязкой к src_ip. Возвращает dict(port, ok, ms, error)."""
+def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None):
+    """
+    TCP-рукопожатие с привязкой к src_ip.
+
+    Если задан server_hostname и порт похож на TLS, следом делается настоящее
+    TLS-рукопожатие с этим именем в SNI. Без него нельзя ответить на вопрос
+    «заблокировано ли»: российский DPI обычно пропускает TCP-соединение и рвёт
+    его уже на ClientHello, так что «порт открыт» ничего не доказывает.
+
+    Возвращает dict(port, ok, ms, error, tls, tls_error).
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
         s.bind((src_ip, 0))
         t0 = time.perf_counter()
         s.connect((dest_ip, port))
-        return {"port": port, "ok": True,
-                "ms": (time.perf_counter() - t0) * 1000.0, "error": None}
+        res = {"port": port, "ok": True,
+               "ms": (time.perf_counter() - t0) * 1000.0, "error": None}
+
+        if server_hostname and port in TLS_PORTS:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False          # проверяем доступность, не доверие
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                with ctx.wrap_socket(s, server_hostname=server_hostname) as tls:
+                    res["tls"] = True
+                    res["tls_proto"] = tls.version()
+            except ssl.SSLError as exc:
+                res["tls"] = False
+                res["tls_error"] = ("TLS отвергнут: %s"
+                                    % str(exc.reason or exc)[:60])
+            except socket.timeout:
+                res["tls"] = False
+                res["tls_error"] = "TLS без ответа (молча режут)"
+            except OSError as exc:
+                code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+                res["tls"] = False
+                res["tls_error"] = ("TLS сброшен" if code == 10054
+                                    else "TLS: %s" % str(exc)[:50])
+        return res
     except socket.timeout:
         return {"port": port, "ok": False, "ms": None, "error": "таймаут"}
     except OSError as exc:
@@ -259,8 +313,10 @@ def probe_target(target, src_ip, ports=(443, 80), icmp_count=4,
         out["icmp_status"] = "сбой ICMP: %s" % str(exc)[:60]
 
     check_ports = [port_in_target] if port_in_target else list(ports)
+    is_name = host != ip                       # SNI имеет смысл только для имени
     for p in check_ports:
-        out["tcp"].append(tcp_check(ip, p, src_ip, timeout=tcp_timeout))
+        out["tcp"].append(tcp_check(ip, p, src_ip, timeout=tcp_timeout,
+                                    server_hostname=host if is_name else None))
     return out
 
 

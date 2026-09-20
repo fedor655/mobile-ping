@@ -202,6 +202,30 @@ def by_index(index):
     return None
 
 
+def capturing_tunnels():
+    """
+    Туннели, которые перехватят трафик раньше, чем сработает привязка к адресу
+    Wi-Fi.
+
+    Полнотуннельные VPN ставят маршруты 0.0.0.0/1 и 128.0.0.0/1: они длиннее
+    обычного 0.0.0.0/0 и потому выигрывают выбор маршрута. Привязка сокета к
+    исходному адресу такой перехват не отменяет, и замер молча уходит через
+    VPN — сайт, заблокированный у оператора, выглядит доступным.
+
+    Признак ищем по адресу интерфейса: у WireGuard/AmneziaWG это отдельная
+    подсеть туннеля, а не адрес локальной сети.
+    """
+    out = []
+    for a in adapters():
+        if not (a["up"] and a["ipv4"]):
+            continue
+        blob = (a["description"] + " " + a["name"]).lower()
+        if any(m in blob for m in ("wireguard", "wintun", "tap-windows",
+                                   "openvpn", "amnezia")):
+            out.append(a)
+    return out
+
+
 def routing_tunnels():
     """
     Интерфейсы-туннели, которые могут перехватывать трафик (WireGuard, OpenVPN,

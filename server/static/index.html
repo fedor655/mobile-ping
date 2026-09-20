@@ -11,14 +11,16 @@
 
 <header class="top">
   <h1>mobile-ping</h1>
-  <span class="sub">проверка доступности с мобильного интернета телефонов</span>
+  <span class="spacer"></span>
+  <span class="sub">(проверка доступности с мобильного интернета телефонов)</span>
+  <a href="/api" class="btnlink">API</a>
 </header>
 
 <div class="card">
   <h2>Новая проверка</h2>
   <form id="f">
-    <label for="targets">Адреса — по одному в строке. Можно <code>1.2.3.4</code>,
-      <code>example.com</code>, <code>1.2.3.4:8443</code></label>
+    <label for="targets">Адреса — по одному в строке / строкой:
+      <code>1.2.3.4</code>, <code>example.com</code>, <code>1.2.3.4:8443</code></label>
     <textarea id="targets" name="targets" spellcheck="false"
       placeholder="1.1.1.1&#10;8.8.8.8&#10;example.com:443"></textarea>
 
@@ -33,7 +35,7 @@
       </div>
       <div>
         <label for="note">Пометка (необязательно)</label>
-        <input type="text" id="note" placeholder="например: проверка перед запуском">
+        <input type="text" id="note">
       </div>
     </div>
 
@@ -57,32 +59,37 @@
 </div>
 <script src="/static/common.js"></script>
 <script>
-let agents = [];
-
 async function loadAgents() {
   const box = document.getElementById('devices');
+  let agents;
   try {
-    const data = await getJSON('/api/agents');
-    agents = data.agents || [];
+    agents = (await getJSON('/api/agents')).agents || [];
   } catch (e) { box.textContent = 'не удалось получить список агентов'; return; }
 
   const all = [];
   for (const a of agents) for (const d of (a.devices || []))
-    all.push({ name: d.name, ssid: d.ssid, online: a.online, agent: a.id });
+    all.push({ name: d.name, ssid: d.ssid, operator: d.operator,
+               online: a.online });
 
   if (!all.length) {
     box.innerHTML = '<span class="empty">агент ещё не отметился. ' +
       'Задание всё равно можно поставить — оно подождёт в очереди.</span>';
     return;
   }
+  // сохраняем отмеченные, чтобы обновление списка не сбрасывало выбор
+  const was = new Set([...document.querySelectorAll('#devices input:checked')]
+    .map(i => i.value));
   box.innerHTML = '';
-  for (const d of all) {
+  all.forEach((d, i) => {
+    const on = was.size ? was.has(d.name) : true;
     const l = document.createElement('label');
-    l.innerHTML = '<input type="checkbox" checked value="' + esc(d.name) + '">' +
+    l.innerHTML = '<input type="checkbox" value="' + esc(d.name) + '"' +
+      (on ? ' checked' : '') + '>' +
       '<span class="dot ' + (d.online ? 'on' : '') + '"></span>' +
-      esc(d.name) + ' <span class="tiny">' + esc(d.ssid || '') + '</span>';
+      '<b>№' + (i + 1) + '</b> <span class="ssid">«' + esc(d.ssid || '?') +
+      '»</span> <span class="op">' + esc(d.operator || d.name) + '</span>';
     box.appendChild(l);
-  }
+  });
 }
 
 async function loadJobs() {
@@ -93,16 +100,17 @@ async function loadJobs() {
   const jobs = data.jobs || [];
   if (!jobs.length) { box.innerHTML = '<span class="empty">пока пусто</span>'; return; }
 
-  let h = '<table><thead><tr><th>Когда</th><th>Статус</th><th>Цели</th>' +
-          '<th>Пометка</th><th>Агент</th></tr></thead><tbody>';
+  let h = '<table><thead><tr><th>№</th><th>Когда</th><th>Статус</th>' +
+          '<th>Заняла</th><th>Цели</th><th>Пометка</th></tr></thead><tbody>';
   for (const j of jobs) {
     h += '<tr>' +
-      '<td class="mono"><a href="/j/' + esc(j.id) + '">' + fmtTime(j.created_at) + '</a></td>' +
+      '<td><a href="/j/' + esc(j.id) + '"><b>№' + (j.num || '—') + '</b></a></td>' +
+      '<td class="mono">' + fmtTime(j.created_at) + '</td>' +
       '<td><span class="pill ' + esc(j.status) + '">' + statusRu(j.status) + '</span></td>' +
+      '<td>' + (j.finished_at ? fmtDur(j.created_at, j.finished_at) : '—') + '</td>' +
       '<td class="mono">' + esc(j.targets.slice(0, 3).join(', ')) +
         (j.targets.length > 3 ? ' <span class="tiny">+' + (j.targets.length - 3) + '</span>' : '') + '</td>' +
       '<td>' + esc(j.note || '') + '</td>' +
-      '<td class="tiny">' + esc(j.agent_id || '') + '</td>' +
       '</tr>';
   }
   box.innerHTML = h + '</tbody></table>';

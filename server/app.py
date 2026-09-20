@@ -16,6 +16,8 @@ mobile-ping server.
     MP_STATIC  каталог статики    (default ./static)
 """
 
+import csv
+import io as _io
 import json
 import os
 import re
@@ -95,6 +97,17 @@ CREATE TABLE IF NOT EXISTS results (
     PRIMARY KEY (job_id, device, target)
 );
 
+-- Журнал агента по заданию: что он делал по шагам. Нужен, чтобы отличить
+-- «цель молчит» от «агент не доехал до этой цели».
+CREATE TABLE IF NOT EXISTS job_logs (
+    job_id       TEXT NOT NULL,
+    ts           REAL NOT NULL,
+    seq          INTEGER NOT NULL,
+    device       TEXT,
+    text         TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS agents (
     id           TEXT PRIMARY KEY,
     devices      TEXT,                   -- json: [{name, ssid}]
@@ -113,9 +126,20 @@ def db():
     return conn
 
 
+MIGRATIONS = [
+    "ALTER TABLE jobs ADD COLUMN num INTEGER",
+    "ALTER TABLE device_runs ADD COLUMN operator TEXT",
+]
+
+
 def init_db():
     with db() as conn:
         conn.executescript(SCHEMA)
+        for stmt in MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass          # колонка уже есть — обычный повторный запуск
 
 
 _claim_lock = threading.Lock()
@@ -195,18 +219,51 @@ def reap_stale_jobs(conn):
     )
 
 
+def store_logs(conn, job_id, lines):
+    """
+    Сложить строки журнала агента. Нумерация сквозная и назначается сервером:
+    агент может слать одну и ту же пачку повторно, если связь оборвалась, и
+    дубли не должны множиться.
+    """
+    if not lines:
+        return
+    row = conn.execute("SELECT MAX(seq) FROM job_logs WHERE job_id=?",
+                       (job_id,)).fetchone()
+    seq = (row[0] or 0) + 1
+    seen = {r[0] for r in conn.execute(
+        "SELECT text FROM job_logs WHERE job_id=?", (job_id,))}
+    for line in lines[:2000]:
+        if isinstance(line, dict):
+            ts, text, device = line.get("ts"), line.get("text"), line.get("device")
+        else:
+            ts, text, device = None, line, None
+        text = str(text or "")[:500]
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        conn.execute(
+            "INSERT OR IGNORE INTO job_logs (job_id, ts, seq, device, text) "
+            "VALUES (?,?,?,?,?)",
+            (job_id, float(ts) if ts else time.time(), seq,
+             str(device)[:64] if device else None, text))
+        seq += 1
+
+
 def create_job(targets, ports, icmp_count, devices_req, note):
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     with db() as conn:
+        # Человеку удобнее ссылаться на «проверку №7», чем на hex-идентификатор.
+        row = conn.execute("SELECT MAX(num) FROM jobs").fetchone()
+        num = (row[0] or 0) + 1
         conn.execute(
-            "INSERT INTO jobs (id, created_at, updated_at, status, note, targets, "
-            "ports, icmp_count, devices_req) VALUES (?,?,?,?,?,?,?,?,?)",
-            (job_id, now, now, "queued", note or "",
+            "INSERT INTO jobs (id, num, created_at, updated_at, status, note, "
+            "targets, ports, icmp_count, devices_req) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (job_id, num, now, now, "queued", note or "",
              json.dumps(targets), json.dumps(ports), icmp_count,
              json.dumps(devices_req) if devices_req else None),
         )
-    return job_id
+    return job_id, num
 
 
 def job_to_dict(conn, job_id, with_results=True):
@@ -215,6 +272,7 @@ def job_to_dict(conn, job_id, with_results=True):
         return None
     job = {
         "id": row["id"],
+        "num": row["num"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "finished_at": row["finished_at"],
@@ -238,7 +296,103 @@ def job_to_dict(conn, job_id, with_results=True):
         d["tcp"] = json.loads(d["tcp"]) if d["tcp"] else []
         results.setdefault(d["device"], {})[d["target"]] = d
     job["results"] = results
+    job["logs"] = [{"ts": r["ts"], "device": r["device"], "text": r["text"]}
+                   for r in conn.execute(
+                       "SELECT ts, device, text FROM job_logs WHERE job_id=? "
+                       "ORDER BY seq", (job_id,))]
     return job
+
+
+def job_to_csv(job):
+    """
+    Плоская таблица для анализа кодом: одна строка на (устройство, цель, порт).
+
+    Длинный формат выбран намеренно: его без подготовки читают pandas, R и
+    любая таблица, а колонки не разъезжаются при смене числа портов.
+    """
+    buf = _io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\n")
+    w.writerow([
+        "job_num", "job_id", "created_at", "note",
+        "device", "operator", "ssid", "device_status", "egress_ip",
+        "egress_operator", "egress_ok", "local_ip",
+        "target", "resolved_ip",
+        "icmp_sent", "icmp_recv", "loss_pct", "rtt_min_ms", "rtt_avg_ms",
+        "rtt_max_ms", "icmp_status",
+        "port", "tcp_ok", "tcp_ms", "tls_ok", "tls_proto", "tls_error",
+        "verdict", "error",
+    ])
+
+    created = iso(job.get("created_at"))
+    by_device = {d["device"]: d for d in job.get("devices", [])}
+
+    for device, targets in (job.get("results") or {}).items():
+        d = by_device.get(device, {})
+        for target in job.get("targets", []):
+            r = targets.get(target)
+            if not r:
+                continue
+            sent = r.get("icmp_sent") or 0
+            recv = r.get("icmp_recv") or 0
+            loss = round(100.0 * (sent - recv) / sent, 1) if sent else ""
+            base = [
+                job.get("num"), job.get("id"), created, job.get("note"),
+                device, d.get("operator") or "", d.get("ssid") or "",
+                d.get("status") or "", d.get("egress_ip") or "",
+                d.get("egress_info") or "",
+                1 if d.get("egress_ok") else 0, d.get("local_ip") or "",
+                target, r.get("resolved_ip") or "",
+                sent, recv, loss,
+                num(r.get("rtt_min")), num(r.get("rtt_avg")),
+                num(r.get("rtt_max")), r.get("icmp_status") or "",
+            ]
+            tcp = r.get("tcp") or []
+            if not tcp:
+                w.writerow(base + ["", "", "", "", "", "",
+                                   verdict(r), r.get("error") or ""])
+                continue
+            for t in tcp:
+                w.writerow(base + [
+                    t.get("port"), 1 if t.get("ok") else 0, num(t.get("ms")),
+                    "" if t.get("tls") is None else (1 if t.get("tls") else 0),
+                    t.get("tls_proto") or "", t.get("tls_error") or "",
+                    verdict(r), r.get("error") or "",
+                ])
+    return buf.getvalue()
+
+
+def num(x, digits=1):
+    return "" if x is None else round(float(x), digits)
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) if ts else ""
+
+
+def verdict(r):
+    """
+    Короткий машинночитаемый итог по цели.
+
+    blocked — TCP открывается, но TLS срывается: почерк DPI.
+    ok      — отвечает хоть чем-то.
+    no_icmp — жив по TCP, но не отвечает на ping.
+    down    — не отвечает ничем.
+    """
+    if r.get("error"):
+        return "error"
+    tcp = r.get("tcp") or []
+    tls_tried = [t for t in tcp if t.get("tls") is not None]
+    if tls_tried and not any(t.get("tls") for t in tls_tried):
+        return "blocked"
+    icmp_ok = (r.get("icmp_recv") or 0) > 0
+    tcp_ok = any(t.get("ok") for t in tcp)
+    if icmp_ok and tcp_ok:
+        return "ok"
+    if tcp_ok:
+        return "no_icmp"
+    if icmp_ok:
+        return "icmp_only"
+    return "down"
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +485,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._api_agents()
                 if path == "/api/agent/poll":
                     return self._api_agent_poll(query)
+                m = re.fullmatch(r"/api/jobs/([0-9a-f]{6,32})/export\.csv", path)
+                if m:
+                    return self._api_export_csv(m.group(1))
+                if path == "/api":
+                    return self._static("api.html")
                 if path == "/api/whoami":
                     return self._api_whoami()
                 if path == "/healthz":
@@ -391,8 +550,9 @@ class Handler(BaseHTTPRequestHandler):
             devices_req = [d for d in re.split(r"[\s,;]+", devices_req) if d]
         note = str(data.get("note") or "")[:200]
 
-        job_id = create_job(targets, ports, icmp_count, devices_req, note)
-        return self._json(201, {"job_id": job_id, "url": "/j/" + job_id})
+        job_id, num = create_job(targets, ports, icmp_count, devices_req, note)
+        return self._json(201, {"job_id": job_id, "num": num,
+                                "url": "/j/" + job_id})
 
     def _api_whoami(self):
         """
@@ -412,10 +572,11 @@ class Handler(BaseHTTPRequestHandler):
         with db() as conn:
             reap_stale_jobs(conn)
             rows = conn.execute(
-                "SELECT id, created_at, status, note, targets, agent_id "
-                "FROM jobs ORDER BY created_at DESC LIMIT 30").fetchall()
+                "SELECT id, num, created_at, finished_at, status, note, targets, "
+                "agent_id FROM jobs ORDER BY created_at DESC LIMIT 50").fetchall()
         return self._json(200, {"jobs": [
-            {"id": r["id"], "created_at": r["created_at"], "status": r["status"],
+            {"id": r["id"], "num": r["num"], "created_at": r["created_at"],
+             "finished_at": r["finished_at"], "status": r["status"],
              "note": r["note"], "agent_id": r["agent_id"],
              "targets": json.loads(r["targets"])}
             for r in rows]})
@@ -427,6 +588,25 @@ class Handler(BaseHTTPRequestHandler):
         if job is None:
             return self._err(404, "задание не найдено")
         return self._json(200, job)
+
+    def _api_export_csv(self, job_id):
+        with db() as conn:
+            job = job_to_dict(conn, job_id)
+        if job is None:
+            return self._err(404, "задание не найдено")
+        body = job_to_csv(job)
+        # BOM — чтобы Excel открыл UTF-8 без плясок с кодировками
+        raw = ("﻿" + body).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         'attachment; filename="mobile-ping-%s.csv"'
+                         % (job.get("num") or job_id))
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
     def _api_agents(self):
         now = time.time()
@@ -499,17 +679,20 @@ class Handler(BaseHTTPRequestHandler):
                             (job_id,)).fetchone() is None:
                 return self._err(404, "задание не найдено")
             conn.execute(
-                "INSERT INTO device_runs (job_id, device, status, ssid, bssid, "
-                "signal, local_ip, gateway, egress_ip, egress_info, egress_ok, "
-                "started_at, finished_at, error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "INSERT INTO device_runs (job_id, device, operator, status, ssid, "
+                "bssid, signal, local_ip, gateway, egress_ip, egress_info, "
+                "egress_ok, started_at, finished_at, error) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(job_id, device) DO UPDATE SET "
+                "operator=excluded.operator, "
                 "status=excluded.status, ssid=excluded.ssid, bssid=excluded.bssid, "
                 "signal=excluded.signal, local_ip=excluded.local_ip, "
                 "gateway=excluded.gateway, egress_ip=excluded.egress_ip, "
                 "egress_info=excluded.egress_info, egress_ok=excluded.egress_ok, "
                 "started_at=excluded.started_at, finished_at=excluded.finished_at, "
                 "error=excluded.error",
-                (job_id, device, str(data.get("status") or "done")[:16],
+                (job_id, device, str(data.get("operator") or "")[:64] or None,
+                 str(data.get("status") or "done")[:16],
                  data.get("ssid"), data.get("bssid"), data.get("signal"),
                  data.get("local_ip"), data.get("gateway"), data.get("egress_ip"),
                  data.get("egress_info"),
@@ -535,6 +718,7 @@ class Handler(BaseHTTPRequestHandler):
                      json.dumps(res.get("tcp") or [], ensure_ascii=False),
                      res.get("error")))
 
+            store_logs(conn, job_id, data.get("logs"))
             conn.execute("UPDATE jobs SET updated_at=? WHERE id=?", (now, job_id))
         return self._json(200, {"ok": True})
 
@@ -551,6 +735,7 @@ class Handler(BaseHTTPRequestHandler):
                 (status, now, now, data.get("error"), job_id))
             if cur.rowcount == 0:
                 return self._err(404, "задание не найдено")
+            store_logs(conn, job_id, data.get("logs"))
         return self._json(200, {"ok": True})
 
 
