@@ -27,11 +27,7 @@
 </div>
 
 <div class="card">
-  <h2>Результаты
-    <label class="logfoot" style="margin:0 0 0 10px; text-transform:none">
-      <input type="checkbox" id="compact"> компактно
-    </label>
-  </h2>
+  <h2>Результаты</h2>
   <div class="scroll" id="matrix"><span class="empty">загрузка…</span></div>
   <p class="tiny" style="margin-top:14px">
     <b class="cell-ok">Зелёное</b> — отвечает;
@@ -54,11 +50,6 @@
 <script>
 const jobId = location.pathname.split('/').filter(Boolean).pop();
 let timer = null;
-let compactTouched = false;
-document.getElementById('compact').addEventListener('change', () => {
-  compactTouched = true; lastRender = null; tick();
-});
-
 // Короткая причина отказа TLS: в ячейке нет места на полную формулировку,
 // разбираться человек всё равно будет по журналу.
 function tlsShort(err) {
@@ -118,8 +109,7 @@ function cellFull(r) {
     const good = o.tlsTried.find(t => t.tls);
     h += good
       ? kv('TLS', esc(good.tls_proto || 'ок'), 'cell-ok')
-      : kv('TLS', esc(tlsShort(o.tlsTried[0].tls_error)) +
-           ' · <b>похоже на блокировку</b>', 'cell-bad');
+      : kv('TLS', esc(tlsShort(o.tlsTried[0].tls_error)), 'cell-bad');
   }
 
   if (r.resolved_ip)
@@ -128,44 +118,12 @@ function cellFull(r) {
   return h + '</div>';
 }
 
-// Компактная ячейка: один значок на устройство, чтобы десяток телефонов
-// помещался в ширину экрана. Подробности — во всплывающей подсказке.
-function cellCompact(r) {
-  const o = readResult(r);
-  let label, hint;
-  if (o.blocked) {
-    label = 'блок';
-    hint = 'TCP открыт, но TLS ' + tlsShort(o.tlsTried[0].tls_error) +
-           ' — похоже на блокировку';
-  } else if (o.icmpOk) {
-    label = o.rtt != null ? o.rtt : '✓';
-    hint = 'ICMP ' + o.recv + '/' + o.sent +
-           (o.rtt != null ? ', ' + o.rtt + ' мс' : '');
-  } else if (o.tcpOk) {
-    label = 'TCP';
-    hint = 'ICMP молчит (' + (r.icmp_status || '—') + '), но TCP открыт';
-  } else {
-    label = '✗';
-    hint = r.icmp_status || 'не отвечает';
-  }
-  if (o.tcp.length)
-    hint += '\nTCP: ' + o.tcp.map(t => t.port + ' ' + (t.ok ? 'открыт' : 'нет'))
-                             .join(', ');
-  if (r.resolved_ip) hint += '\n' + r.resolved_ip;
-  return '<span class="badge ' + o.cls + '" title="' + esc(hint) + '">' +
-         esc(String(label)) + '</span>';
-}
-
-function cellHTML(r, compact) {
+function cellHTML(r) {
   if (!r) return '<span class="cell-na">—</span>';
   if (r.error)
-    return compact
-      ? '<span class="badge cell-bad" title="' + esc(r.error) + '">сбой</span>'
-      : '<div class="kv">' + kv('сбой', esc(r.error), 'cell-bad') + '</div>';
-  return compact ? cellCompact(r) : cellFull(r);
+    return '<div class="kv">' + kv('сбой', esc(r.error), 'cell-bad') + '</div>';
+  return cellFull(r);
 }
-
-let lastRender = null;
 
 function render(job) {
   document.getElementById('title').textContent = '№' + (job.num || '—');
@@ -186,7 +144,7 @@ function render(job) {
     if (d.started_at && d.finished_at) onDevices += d.finished_at - d.started_at;
   const total = end ? end - job.created_at : null;
   document.getElementById('took').textContent =
-    total ? 'заняла ' + fmtSec(total) : '';
+    total ? 'заняла всего: ' + fmtSec(total) : '';
 
   const warn = document.getElementById('warn');
   let w = '';
@@ -211,7 +169,7 @@ function render(job) {
               'IP от точки</th>' +
             '<th class="mono" title="как нас видят снаружи — по нему и ' +
               'подтверждается, что выход мобильный">IP в интернете</th>' +
-            '<th>Определился как</th><th>Время</th></tr></thead><tbody>';
+            '<th>Оператор определился как</th><th>Время</th></tr></thead><tbody>';
     devs.forEach((d, i) => {
       h += '<tr><td><b>' + esc(devName(d, i)) + '</b></td>' +
         '<td class="mono">' + (d.ssid ? '«' + esc(d.ssid) + '»' : '—') + '</td>' +
@@ -230,10 +188,12 @@ function render(job) {
         '<td>' + (d.started_at && d.finished_at
                   ? fmtSec(d.finished_at - d.started_at) : '—') + '</td></tr>';
     });
-    h += '<tr class="totals"><td colspan="8">На устройствах' +
-         (total ? ' · остальное (очередь, переключения, возврат) — ' +
-                  fmtSec(Math.max(0, total - onDevices)) : '') +
-         '</td><td>' + fmtSec(onDevices) + '</td></tr>';
+    h += '<tr class="totals"><td colspan="8">На устройствах заняла:</td>' +
+         '<td>' + fmtSec(onDevices) + '</td></tr>';
+    if (total)
+      h += '<tr class="totals"><td colspan="8">остальное ' +
+           '(очередь, переключения, возврат):</td><td>' +
+           fmtSec(Math.max(0, total - onDevices)) + '</td></tr>';
     dbox.innerHTML = h + '</tbody></table>';
   }
 
@@ -243,14 +203,7 @@ function render(job) {
     mbox.innerHTML = '<span class="empty">результатов пока нет</span>';
     return;
   }
-  // При десятке устройств подробные ячейки не помещаются — сжимаем сами,
-  // но выбор человека важнее автоматики.
-  const box = document.getElementById('compact');
-  if (!compactTouched) box.checked = devs.length > 4;
-  const compact = box.checked;
-
-  let h = '<table class="matrix' + (compact ? ' compact' : '') +
-          '"><thead><tr><th>Цель</th>';
+  let h = '<table class="matrix"><thead><tr><th>Цель</th>';
   devs.forEach((d, i) => {
     h += '<th title="' + esc([d.ssid && '«' + d.ssid + '»', d.operator]
                              .filter(Boolean).join(' · ')) + '">' +
@@ -260,7 +213,7 @@ function render(job) {
   for (const t of job.targets) {
     h += '<tr><td class="t">' + esc(t) + '</td>';
     for (const d of devs)
-      h += '<td>' + cellHTML(((job.results || {})[d.device] || {})[t], compact) + '</td>';
+      h += '<td>' + cellHTML(((job.results || {})[d.device] || {})[t]) + '</td>';
     h += '</tr>';
   }
   mbox.innerHTML = h + '</tbody></table>';

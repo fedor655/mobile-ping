@@ -338,6 +338,25 @@ def _http_get(host, path, src_ip, timeout=8, port=80):
         conn.close()
 
 
+def _operator_of(ip, src_ip, timeout):
+    """
+    Чей это диапазон. Спрашиваем публичный справочник ip-api.com — он отдаёт
+    владельца по базам RIPE, отсюда и «PJSC Vimpelcom · Russia».
+
+    Вызывается отдельно от определения самого адреса: адрес надёжнее взять у
+    своего сервера, а название оператора он подсказать не может.
+    """
+    try:
+        body = _http_get("ip-api.com", "/json/%s?fields=country,isp" % ip,
+                         src_ip, timeout)
+        if body:
+            d = json.loads(body)
+            return " · ".join(x for x in (d.get("isp"), d.get("country")) if x)[:120]
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def egress_info(src_ip, own_server=None, timeout=5, budget=20):
     """
     Узнать, с какого внешнего адреса виден трафик, уходящий с src_ip.
@@ -363,7 +382,11 @@ def egress_info(src_ip, own_server=None, timeout=5, budget=20):
             if body:
                 ip = json.loads(body).get("ip")
                 if ip:
-                    return {"ip": ip, "info": ""}
+                    # адрес уже знаем точно; название оператора — по желанию,
+                    # на него тратим не больше пары секунд
+                    return {"ip": ip,
+                            "info": _operator_of(ip, src_ip, min(3.0, left()))
+                                    if left() > 0 else ""}
         except (OSError, ValueError):
             pass
 

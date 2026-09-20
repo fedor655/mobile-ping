@@ -190,12 +190,4 @@ pre {
    в горизонтальную прокрутку, а не растягивает вёрстку */
 .scroll { overflow-x: auto; }
 
-/* компактная ячейка — один значок на устройство */
-.badge {
-  display: inline-block; min-width: 38px; text-align: center;
-  font-family: var(--mono); font-size: 12px; font-weight: 700;
-  border-radius: 5px; padding: 3px 7px; cursor: default;
-  background: var(--panel-2); border: 1px solid var(--line);
-}
-.matrix.compact td, .matrix.compact th { padding: 5px 6px; }
-.matrix.compact .t { font-size: 12px; }
+header.top .subtle { color: var(--muted); font-size: 12px; }
