@@ -57,8 +57,15 @@ DEFAULTS = {
     # Молчащая цель занимает поток ровно на icmp_count x icmp_timeout, и
     # ничего кроме ожидания не делает. Поэтому пропускная способность — это
     # parallel / (icmp_count x icmp_timeout), и упирается она в число потоков,
-    # а не в канал. Под списки, где большинство адресов молчит, берём с запасом.
+    # а не в канал: мобильный канал держит 3000 пингов в секунду без потерь.
     "parallel": 500,
+    # А вот TCP так нельзя. Каждое соединение занимает запись в таблице NAT
+    # телефона, и её размер невелик. Замер на Билайне: до 192 потоков неудач
+    # нет, на 320 их уже 45%, на 500 — две трети. То есть выше порога замер
+    # начинает врать про закрытые порты, а это худший вид ошибки: цифры идут,
+    # выглядят правдоподобно и неверны. Берём с запасом вдвое от порога;
+    # найти свой для каждого телефона умеет bench.py.
+    "parallel_tcp": 128,
     "known_non_mobile_ips": [],
 }
 
@@ -194,22 +201,16 @@ class Client:
 # --------------------------------------------------------------------------
 
 def measure(targets, src_ip, ports, icmp_count, icmp_timeout_ms, tcp_timeout,
-            parallel):
-    """Прогнать список целей с привязкой к src_ip. Порядок результатов сохраняется."""
-    def one(t):
-        try:
-            return probe.probe_target(
-                t, src_ip, ports=ports, icmp_count=icmp_count,
-                icmp_timeout_ms=icmp_timeout_ms, tcp_timeout=tcp_timeout)
-        except Exception as exc:
-            return {"target": t, "error": "сбой замера: %s" % str(exc)[:80],
-                    "tcp": []}
-
-    # Больше потоков, чем целей, заводить незачем: пул создаёт их по мере
-    # надобности, но верхнюю границу лучше держать осмысленной.
-    workers = max(1, min(int(parallel), len(targets), 1024))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(one, targets))
+            parallel_icmp, parallel_tcp):
+    """Прогнать список целей. Порядок результатов сохраняется."""
+    try:
+        return probe.probe_many(
+            targets, src_ip, ports=ports, icmp_count=icmp_count,
+            icmp_timeout_ms=icmp_timeout_ms, tcp_timeout=tcp_timeout,
+            parallel_icmp=parallel_icmp, parallel_tcp=parallel_tcp)
+    except Exception as exc:
+        return [{"target": t, "error": "сбой замера: %s" % str(exc)[:80],
+                 "tcp": []} for t in targets]
 
 
 def is_usb(dev):
@@ -433,7 +434,7 @@ class Agent:
             targets, src_ip, ports, icmp_count,
             job.get("icmp_timeout_ms") or self.cfg["icmp_timeout_ms"],
             job.get("tcp_timeout") or self.cfg["tcp_timeout"],
-            self.cfg["parallel"])
+            self.cfg["parallel"], self.cfg["parallel_tcp"])
 
         # Если замер развалился из-за исходного адреса, это сбой устройства, а
         # не приговор целям: показывать такое как «не отвечает» нельзя.

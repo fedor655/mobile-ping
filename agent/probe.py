@@ -28,6 +28,7 @@ import socket
 import ssl
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 iphlpapi = ctypes.WinDLL("iphlpapi.dll")
 kernel32 = ctypes.WinDLL("kernel32.dll")
@@ -288,6 +289,74 @@ def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None):
         return {"port": port, "ok": False, "ms": None, "error": str(short)[:80]}
     finally:
         s.close()
+
+
+def probe_many(targets, src_ip, ports=(443, 80), icmp_count=4,
+               icmp_timeout_ms=2000, tcp_timeout=3.0,
+               parallel_icmp=500, parallel_tcp=64):
+    """
+    Замер списка целей в две фазы с разной параллельностью.
+
+    Так сделано не для красоты. ICMP — это одиночные пакеты без состояния,
+    мобильный канал держит их тысячами в секунду без потерь. А каждое
+    TCP-соединение занимает запись в таблице NAT телефона, и она невелика:
+    замер показал, что при 500 одновременных соединениях две трети из них не
+    проходят вовсе. С общим лимитом потоков пришлось бы выбирать между
+    медленным ICMP и массой ложных «порт закрыт» — поэтому фазы разведены.
+
+    Порядок целей сохраняется.
+    """
+    def resolve_one(t):
+        host, port_in_target = split_target(t)
+        out = {"target": t, "resolved_ip": None, "icmp_sent": None,
+               "icmp_recv": None, "rtt_min": None, "rtt_avg": None,
+               "rtt_max": None, "icmp_status": None, "tcp": [], "error": None}
+        try:
+            out["resolved_ip"] = resolve(host)
+        except OSError as exc:
+            out["error"] = "имя не разрешилось: %s" % str(exc)[:60]
+        out["_host"] = host
+        out["_ports"] = [port_in_target] if port_in_target else list(ports)
+        out["_is_name"] = host != out["resolved_ip"]
+        return out
+
+    # Имена разрешаем заранее: DNS бывает медленным, и держать под него
+    # потоки самого замера незачем.
+    with ThreadPoolExecutor(max_workers=max(1, min(64, len(targets)))) as pool:
+        results = list(pool.map(resolve_one, targets))
+
+    live = [r for r in results if r["resolved_ip"]]
+
+    def do_icmp(r):
+        try:
+            got = icmp_ping(r["resolved_ip"], src_ip, count=icmp_count,
+                            timeout_ms=icmp_timeout_ms)
+            r.update(icmp_sent=got["sent"], icmp_recv=got["recv"],
+                     rtt_min=got["rtt_min"], rtt_avg=got["rtt_avg"],
+                     rtt_max=got["rtt_max"], icmp_status=got["status"])
+        except OSError as exc:
+            r["icmp_status"] = "сбой ICMP: %s" % str(exc)[:60]
+
+    def do_tcp(r):
+        for port in r["_ports"]:
+            r["tcp"].append(tcp_check(
+                r["resolved_ip"], port, src_ip, timeout=tcp_timeout,
+                server_hostname=r["_host"] if r["_is_name"] else None))
+
+    if live:
+        n = max(1, min(int(parallel_icmp), len(live), 2048))
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            list(pool.map(do_icmp, live))
+
+        n = max(1, min(int(parallel_tcp), len(live), 512))
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            list(pool.map(do_tcp, live))
+
+    for r in results:
+        r.pop("_host", None)
+        r.pop("_ports", None)
+        r.pop("_is_name", None)
+    return results
 
 
 def probe_target(target, src_ip, ports=(443, 80), icmp_count=4,
