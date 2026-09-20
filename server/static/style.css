@@ -191,3 +191,9 @@ pre {
 .scroll { overflow-x: auto; }
 
 header.top .subtle { color: var(--muted); font-size: 12px; }
+
+select {
+  width: 100%; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  font-size: 13px;
+}

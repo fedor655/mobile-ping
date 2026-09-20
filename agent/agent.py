@@ -24,6 +24,7 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -53,7 +54,11 @@ DEFAULTS = {
     "icmp_count": 4,
     "icmp_timeout_ms": 2000,
     "tcp_timeout": 3.0,
-    "parallel": 4,
+    # Молчащая цель занимает поток ровно на icmp_count x icmp_timeout, и
+    # ничего кроме ожидания не делает. Поэтому пропускная способность — это
+    # parallel / (icmp_count x icmp_timeout), и упирается она в число потоков,
+    # а не в канал. Под списки, где большинство адресов молчит, берём с запасом.
+    "parallel": 500,
     "known_non_mobile_ips": [],
 }
 
@@ -62,7 +67,10 @@ DEFAULTS = {
 # вместе с результатами: по одной таблице нельзя понять, почему цель молчала,
 # а по журналу видно, дошёл ли агент до неё вообще.
 _capture = None
-_device = None
+_capture_lock = threading.Lock()
+# Телефоны на кабеле меряются одновременно, поэтому «текущее устройство»
+# у каждого потока своё, иначе строки журнала перемешаются между телефонами.
+_local = threading.local()
 
 
 def log(msg):
@@ -73,38 +81,46 @@ def log(msg):
             fh.write(line + "\n")
     except OSError:
         pass
-    if _capture is not None:
-        _capture.append({"ts": time.time(), "device": _device, "text": msg})
+    with _capture_lock:
+        if _capture is not None:
+            _capture.append({"ts": time.time(),
+                             "device": getattr(_local, "device", None),
+                             "text": msg})
 
 
 def start_capture():
-    global _capture, _device
-    _capture, _device = [], None
+    global _capture
+    with _capture_lock:
+        _capture = []
+    _local.device = None
 
 
 def stop_capture():
-    global _capture, _device
-    _capture, _device = None, None
+    global _capture
+    with _capture_lock:
+        _capture = None
+    _local.device = None
 
 
 def take_logs():
     """Забрать накопленное и очистить буфер."""
     global _capture
-    if _capture is None:
-        return []
-    out, _capture = _capture, []
+    with _capture_lock:
+        if _capture is None:
+            return []
+        out, _capture = _capture, []
     return out
 
 
 def peek_logs():
     """Копия накопленного, без очистки: сервер отбрасывает дубли по тексту,
     поэтому промежуточные отправки безопасны и журнал виден по ходу дела."""
-    return list(_capture) if _capture is not None else []
+    with _capture_lock:
+        return list(_capture) if _capture is not None else []
 
 
 def set_log_device(name):
-    global _device
-    _device = name
+    _local.device = name
 
 
 def load_config(path=CONFIG_PATH):
@@ -155,8 +171,10 @@ class Client:
         return self._call("POST", "/api/agent/hello",
                           {"agent_id": agent_id, "version": VERSION,
                            "state": state,
-                           "devices": [{"name": d["name"], "ssid": d["ssid"],
+                           "devices": [{"name": d["name"],
+                                        "ssid": d.get("ssid") or d.get("adapter"),
                                         "operator": d.get("operator"),
+                                        "link": "usb" if is_usb(d) else "wifi",
                                         "num": i + 1}
                                        for i, d in enumerate(devices)]})
 
@@ -187,8 +205,16 @@ def measure(targets, src_ip, ports, icmp_count, icmp_timeout_ms, tcp_timeout,
             return {"target": t, "error": "сбой замера: %s" % str(exc)[:80],
                     "tcp": []}
 
-    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+    # Больше потоков, чем целей, заводить незачем: пул создаёт их по мере
+    # надобности, но верхнюю границу лучше держать осмысленной.
+    workers = max(1, min(int(parallel), len(targets), 1024))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(one, targets))
+
+
+def is_usb(dev):
+    """Телефон подключён кабелем, а не раздаёт Wi-Fi."""
+    return (dev.get("link") or "wifi").lower() == "usb"
 
 
 class Agent:
@@ -294,26 +320,51 @@ class Agent:
             not_mobile.add(home_ip)
             log("внешний IP обычной сети: %s" % home_ip)
 
+        numbered = list(enumerate(devices, start=1))
+        by_usb = [(n, d) for n, d in numbered if is_usb(d)]
+        by_wifi = [(n, d) for n, d in numbered if not is_usb(d)]
+
         buffered = []
+        buffered_lock = threading.Lock()
         job_error = None
-        try:
-            for i, dev in enumerate(devices):
-                payload = self.run_device(dev, job, targets, ports, icmp_count,
-                                          not_mobile, num=i + 1)
-                payload["logs"] = take_logs()
-                try:
-                    self.client.send_device(job["id"], payload)
-                except OSError as exc:
-                    log("сервер недоступен с этой сети (%s) — придержу результат"
-                        % str(exc)[:80])
+
+        def deliver(payload):
+            """Отдать результат устройства; не дошло — придержать до дома."""
+            payload["logs"] = take_logs()
+            try:
+                self.client.send_device(job["id"], payload)
+            except OSError as exc:
+                log("сервер недоступен с этой сети (%s) — придержу результат"
+                    % str(exc)[:80])
+                with buffered_lock:
                     buffered.append(payload)
+
+        try:
+            # Телефоны на кабеле независимы: у каждого свой адаптер,
+            # переключать нечего. Поэтому меряем их одновременно, и обход
+            # занимает столько же, сколько один телефон.
+            if by_usb:
+                log("по кабелю: %d устройств, меряю одновременно" % len(by_usb))
+                with ThreadPoolExecutor(max_workers=len(by_usb)) as pool:
+                    futures = [pool.submit(self.run_usb_device, dev, job,
+                                           targets, ports, icmp_count,
+                                           not_mobile, n)
+                               for n, dev in by_usb]
+                    for f in futures:
+                        deliver(f.result())
+
+            # Wi-Fi — строго по очереди: адаптер один на всех.
+            for n, dev in by_wifi:
+                deliver(self.run_wifi_device(dev, job, targets, ports,
+                                             icmp_count, not_mobile, n))
         except Exception as exc:
             job_error = str(exc)[:200]
             log("задание прервано: %s" % job_error)
             log(traceback.format_exc())
         finally:
             set_log_device(None)
-            self.go_home()
+            if by_wifi:
+                self.go_home()
 
         for payload in buffered:
             try:
@@ -331,22 +382,147 @@ class Agent:
             log("не удалось закрыть задание: %s" % str(exc)[:100])
         stop_capture()
 
-    def run_device(self, dev, job, targets, ports, icmp_count, not_mobile,
-                   num=None):
-        name, ssid = dev["name"], dev["ssid"]
+    def check_egress(self, payload, src_ip, not_mobile):
+        """
+        Убедиться, что с этого адреса мы выходим именно в мобильную сеть.
+
+        Возвращает True, если мерить можно. Иначе заполняет payload причиной:
+        приватный внешний адрес означает перехват туннелем, совпадение с
+        домашним — что канал вообще не тот. Общее для кабеля и Wi-Fi.
+        """
+        eg = probe.egress_info(src_ip, own_server=self.server_host())
+        egress_ip = eg.get("ip")
+        payload["egress_ip"] = egress_ip
+        payload["egress_info"] = eg.get("info")
+
+        # Мобильный выход подтверждён, только если внешний адрес публичный и не
+        # совпадает с обычной сетью. Приватный адрес означает, что запрос пришёл
+        # на сервер из туннеля: на машине поднят VPN с маршрутами 0.0.0.0/1, и
+        # он перехватывает трафик раньше, чем сработает привязка к адресу
+        # интерфейса. Именно так заблокированный сайт кажется доступным.
+        payload["egress_ok"] = bool(
+            egress_ip and probe.is_public_ip(egress_ip)
+            and egress_ip not in not_mobile)
+
+        if payload["egress_ok"]:
+            log("  внешний IP %s (%s) — мобильная сеть подтверждена"
+                % (egress_ip, eg.get("info") or "оператор неизвестен"))
+            return True
+        if egress_ip and not probe.is_public_ip(egress_ip):
+            payload.update(status="error", finished_at=time.time(),
+                           error="трафик ушёл в туннель, а не через телефон: "
+                                 "внешний адрес %s приватный. Отключите VPN на "
+                                 "машине агента." % egress_ip)
+            log("  ВНИМАНИЕ: внешний адрес %s приватный — трафик перехвачен "
+                "туннелем, замер отменён" % egress_ip)
+            return False
+        if egress_ip:
+            payload.update(status="error", finished_at=time.time(),
+                           error="внешний IP %s совпадает с обычной сетью — "
+                                 "замер шёл не через телефон" % egress_ip)
+            log("  ВНИМАНИЕ: внешний IP %s совпадает с обычной сетью, "
+                "замер отменён" % egress_ip)
+            return False
+        log("  внешний IP определить не удалось — за точкой нет интернета")
+        return True
+
+    def measure_into(self, payload, src_ip, targets, ports, icmp_count, job):
+        """Прогнать цели и разложить результат. Общее для кабеля и Wi-Fi."""
+        started = payload["started_at"]
+        payload["results"] = measure(
+            targets, src_ip, ports, icmp_count,
+            job.get("icmp_timeout_ms") or self.cfg["icmp_timeout_ms"],
+            job.get("tcp_timeout") or self.cfg["tcp_timeout"],
+            self.cfg["parallel"])
+
+        # Если замер развалился из-за исходного адреса, это сбой устройства, а
+        # не приговор целям: показывать такое как «не отвечает» нельзя.
+        invalid = [r for r in payload["results"] if probe.result_is_invalid(r)]
+        if invalid and len(invalid) == len(payload["results"]):
+            payload.update(status="error", finished_at=time.time(),
+                           error="замер недействителен: исходный адрес %s "
+                                 "пропал с адаптера" % src_ip)
+            log("  ВНИМАНИЕ: замер недействителен, адрес %s пропал" % src_ip)
+            return payload
+
+        payload["status"] = "done"
+        payload["finished_at"] = time.time()
+        ok = sum(1 for r in payload["results"] if (r.get("icmp_recv") or 0) > 0)
+        tcp_ok = sum(1 for r in payload["results"]
+                     if any(t.get("ok") for t in (r.get("tcp") or [])))
+        log("  готово за %d с: ICMP ответили %d из %d, TCP открыт у %d"
+            % (payload["finished_at"] - started, ok, len(targets), tcp_ok))
+        return payload
+
+    def report_running(self, job, payload):
+        """Показать на сайте, что устройство взято в работу. Не критично."""
+        if job.get("id") in (None, "local"):
+            return
+        try:
+            probe_payload = dict(payload)
+            probe_payload.update(status="running", results=[],
+                                 logs=peek_logs())
+            self.client.send_device(job["id"], probe_payload)
+        except OSError:
+            pass
+
+    def run_usb_device(self, dev, job, targets, ports, icmp_count, not_mobile,
+                       num=None):
+        """
+        Телефон на кабеле: переключать нечего, просто берём его адаптер.
+
+        Отсюда и выигрыш — несколько таких телефонов меряются одновременно,
+        а не по очереди, и заодно заряжаются.
+        """
+        name = dev["name"]
+        set_log_device(name)
+        started = time.time()
+        payload = {"device": name, "operator": dev.get("operator"), "num": num,
+                   "link": "usb", "ssid": dev.get("adapter"),
+                   "started_at": started, "status": "error", "results": []}
+        self.report_running(job, payload)
+
+        pattern = dev.get("adapter")
+        adapter = netinfo.find_adapter(pattern) if pattern else None
+        if adapter is None:
+            payload.update(error="адаптер %r не найден: телефон отключён или "
+                                 "выключен режим USB-модема" % pattern,
+                           finished_at=time.time())
+            log("--- устройство %r: адаптер %r не найден" % (name, pattern))
+            return payload
+        if not adapter["ipv4"]:
+            payload.update(error="у адаптера %r нет адреса: телефон не раздаёт "
+                                 "интернет" % adapter["name"],
+                           finished_at=time.time())
+            log("--- устройство %r: у %r нет адреса" % (name, adapter["name"]))
+            return payload
+
+        src_ip = adapter["ipv4"][0]
+        payload.update(ssid=adapter["name"], local_ip=src_ip,
+                       gateway=adapter["gateways"][0] if adapter["gateways"]
+                       else None)
+        log("--- устройство %r: кабель, адаптер %r, IP %s"
+            % (name, adapter["name"], src_ip))
+
+        if not probe.source_usable(src_ip):
+            payload.update(error="адрес %s не годится для замера" % src_ip,
+                           finished_at=time.time())
+            return payload
+        if not self.check_egress(payload, src_ip, not_mobile):
+            return payload
+        return self.measure_into(payload, src_ip, targets, ports, icmp_count,
+                                 job)
+
+    def run_wifi_device(self, dev, job, targets, ports, icmp_count, not_mobile,
+                        num=None):
+        """Телефон, раздающий Wi-Fi: адаптер один, поэтому строго по очереди."""
+        name, ssid = dev["name"], dev.get("ssid")
         set_log_device(name)
         started = time.time()
         payload = {"device": name, "ssid": ssid, "operator": dev.get("operator"),
-                   "num": num, "started_at": started, "status": "error",
-                   "results": []}
-
-        try:
-            self.client.send_device(job["id"], {
-                "device": name, "ssid": ssid, "operator": dev.get("operator"),
-                "num": num, "status": "running", "started_at": started,
-                "results": [], "logs": peek_logs()})
-        except OSError:
-            pass                                  # прогресс не критичен
+                   "num": num, "link": "wifi", "started_at": started,
+                   "status": "error", "results": []}
+        self.report_running(job, payload)
 
         log("--- устройство %r: подключаюсь к %r" % (name, ssid))
         try:
@@ -355,7 +531,7 @@ class Agent:
         except Exception as exc:
             # Не подключились — самое полезное, что можно сказать человеку:
             # видно ли точку вообще. «Не видна» и «видна, но не пускает» —
-            # это две совершенно разные проблемы.
+            # совершенно разные проблемы.
             hint = ""
             try:
                 seen = [n for n in wifi.scan(self.adapter_desc)
@@ -377,44 +553,11 @@ class Agent:
         log("  подключён: IP %s, шлюз %s, сигнал %s"
             % (src_ip, gw, payload["signal"]))
 
-        eg = probe.egress_info(src_ip, own_server=self.server_host())
-        egress_ip = eg.get("ip")
-        payload["egress_ip"] = egress_ip
-        payload["egress_info"] = eg.get("info")
-
-        # Мобильный выход считается подтверждённым, только если внешний адрес
-        # публичный и не совпадает с обычной сетью. Приватный адрес означает,
-        # что запрос пришёл на сервер из туннеля: на машине поднят VPN с
-        # маршрутами 0.0.0.0/1, и он перехватывает трафик раньше, чем
-        # сработает привязка к адресу Wi-Fi. Такие замеры недействительны —
-        # именно так «заблокированный» сайт оказывается доступным.
-        payload["egress_ok"] = bool(
-            egress_ip and probe.is_public_ip(egress_ip)
-            and egress_ip not in not_mobile)
-
-        if payload["egress_ok"]:
-            log("  внешний IP %s (%s) — мобильная сеть подтверждена"
-                % (egress_ip, eg.get("info") or "оператор неизвестен"))
-        elif egress_ip and not probe.is_public_ip(egress_ip):
-            payload.update(status="error", finished_at=time.time(),
-                           error="трафик ушёл в туннель, а не через телефон: "
-                                 "внешний адрес %s приватный. Отключите VPN на "
-                                 "машине агента." % egress_ip)
-            log("  ВНИМАНИЕ: внешний адрес %s приватный — трафик перехвачен "
-                "туннелем, замер отменён" % egress_ip)
+        if not self.check_egress(payload, src_ip, not_mobile):
             return payload
-        elif egress_ip:
-            payload.update(status="error", finished_at=time.time(),
-                           error="внешний IP %s совпадает с обычной сетью — "
-                                 "замер шёл не через телефон" % egress_ip)
-            log("  ВНИМАНИЕ: внешний IP %s совпадает с обычной сетью, "
-                "замер отменён" % egress_ip)
-            return payload
-        else:
-            log("  внешний IP определить не удалось — за точкой нет интернета")
 
-        # Адрес мог смениться, пока мы ходили за внешним IP. Замер с исчезнувшего
-        # адреса молча превращается в «цель недоступна», поэтому проверяем.
+        # Адрес мог смениться, пока ходили за внешним IP: Wi-Fi только что
+        # переподключался, и DHCP мог выдать другой.
         if not probe.source_usable(src_ip):
             fresh = netinfo.by_index(self.adapter["index"])
             new_ip = fresh["ipv4"][0] if fresh and fresh["ipv4"] else None
@@ -429,29 +572,8 @@ class Agent:
                 log("  адрес %s исчез с адаптера, замер отменён" % src_ip)
                 return payload
 
-        payload["results"] = measure(
-            targets, src_ip, ports, icmp_count, self.cfg["icmp_timeout_ms"],
-            self.cfg["tcp_timeout"], self.cfg["parallel"])
-
-        # Если замер развалился из-за исходного адреса, это сбой устройства, а
-        # не приговор целям: показывать такое как «не отвечает» нельзя.
-        invalid = [r for r in payload["results"] if probe.result_is_invalid(r)]
-        if invalid and len(invalid) == len(payload["results"]):
-            payload.update(status="error", finished_at=time.time(),
-                           error="замер недействителен: исходный адрес %s "
-                                 "пропал с адаптера" % src_ip)
-            log("  ВНИМАНИЕ: замер недействителен, адрес %s пропал" % src_ip)
-            return payload
-
-        payload["status"] = "done"
-        payload["finished_at"] = time.time()
-
-        ok = sum(1 for r in payload["results"] if (r.get("icmp_recv") or 0) > 0)
-        tcp_ok = sum(1 for r in payload["results"]
-                     if any(t.get("ok") for t in (r.get("tcp") or [])))
-        log("  готово за %d с: ICMP ответили %d из %d, TCP открыт у %d"
-            % (payload["finished_at"] - started, ok, len(targets), tcp_ok))
-        return payload
+        return self.measure_into(payload, src_ip, targets, ports, icmp_count,
+                                 job)
 
     # -- главный цикл ----------------------------------------------------
 
@@ -518,7 +640,14 @@ def selftest(cfg):
     print("  агент:    %s" % cfg["agent_id"])
     print("  обычная сеть: %s" % (cfg["home"].get("ssid") or "не задана"))
     for d in cfg["devices"]:
-        print("  устройство: %-16s SSID %r" % (d["name"], d["ssid"]))
+        if is_usb(d):
+            a = netinfo.find_adapter(d.get("adapter"))
+            print("  устройство: %-6s кабель, адаптер %-16r %s"
+                  % (d["name"], d.get("adapter"),
+                     (",".join(a["ipv4"]) or "без адреса") if a
+                     else "НЕ НАЙДЕН"))
+        else:
+            print("  устройство: %-6s Wi-Fi,  точка %r" % (d["name"], d.get("ssid")))
 
 
 def local_run(cfg, targets, ports, device_names=None):
@@ -536,13 +665,14 @@ def local_run(cfg, targets, ports, device_names=None):
         print("внешний IP обычной сети: %s" % home_ip)
 
     fake_job = {"id": "local", "targets": targets, "ports": ports,
-                "icmp_count": cfg["icmp_count"]}
+                "icmp_count": cfg["icmp_count"], "icmp_timeout_ms": None,
+                "tcp_timeout": None}
     rows = []
     try:
-        for i, dev in enumerate(devices):
-            payload = agent.run_device(dev, fake_job, targets, ports,
-                                       cfg["icmp_count"], not_mobile, num=i + 1)
-            rows.append(payload)
+        for i, dev in enumerate(devices, start=1):
+            run = agent.run_usb_device if is_usb(dev) else agent.run_wifi_device
+            rows.append(run(dev, fake_job, targets, ports, cfg["icmp_count"],
+                            not_mobile, i))
     finally:
         agent.go_home()
 

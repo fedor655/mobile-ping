@@ -202,6 +202,37 @@ def by_index(index):
     return None
 
 
+def find_adapter(pattern):
+    """
+    Найти адаптер по имени или описанию: точное совпадение имени, иначе
+    подстрока. Так телефон, подключённый по USB, задаётся в настройках как
+    «UsbNcm» или «Remote NDIS», а не индексом, который меняется.
+    """
+    if not pattern:
+        return None
+    ads = adapters()
+    for a in ads:
+        if a["name"] == pattern:
+            return a
+    low = pattern.lower()
+    for a in ads:
+        if low in a["name"].lower() or low in a["description"].lower():
+            return a
+    return None
+
+
+def usb_tethering_adapters():
+    """Телефоны, отдающие интернет по кабелю: RNDIS у Android, NCM у новых."""
+    marks = ("rndis", "remote ndis", "usbncm", "usb ncm", "ncm host",
+             "usb ethernet", "iphone", "mobile device ethernet")
+    out = []
+    for a in adapters():
+        blob = (a["description"] + " " + a["name"]).lower()
+        if any(m in blob for m in marks):
+            out.append(a)
+    return out
+
+
 def capturing_tunnels():
     """
     Туннели, которые перехватят трафик раньше, чем сработает привязка к адресу

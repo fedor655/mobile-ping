@@ -42,7 +42,7 @@ JOB_LEASE_SEC = 30 * 60
 # Агент, не подававший признаков жизни дольше этого, показывается офлайном.
 AGENT_STALE_SEC = 120
 
-MAX_TARGETS = 100
+MAX_TARGETS = 1000
 MAX_PORTS = 6
 
 SCHEMA = """
@@ -130,6 +130,9 @@ MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN num INTEGER",
     "ALTER TABLE device_runs ADD COLUMN operator TEXT",
     "ALTER TABLE device_runs ADD COLUMN num INTEGER",
+    "ALTER TABLE device_runs ADD COLUMN link TEXT",
+    "ALTER TABLE jobs ADD COLUMN icmp_timeout_ms INTEGER",
+    "ALTER TABLE jobs ADD COLUMN tcp_timeout REAL",
 ]
 
 
@@ -182,6 +185,16 @@ def parse_targets(raw):
     if not out:
         raise ValueError("не задано ни одной цели")
     return out
+
+
+def clamp_num(value, lo, hi, cast):
+    """Число из запроса в разумных границах; пусто — значение по умолчанию."""
+    if value in (None, ""):
+        return None
+    try:
+        return max(lo, min(hi, cast(value)))
+    except (TypeError, ValueError):
+        raise ValueError("ожидалось число, получено %r" % str(value)[:20])
 
 
 def parse_ports(raw):
@@ -250,7 +263,8 @@ def store_logs(conn, job_id, lines):
         seq += 1
 
 
-def create_job(targets, ports, icmp_count, devices_req, note):
+def create_job(targets, ports, icmp_count, devices_req, note,
+               icmp_timeout_ms=None, tcp_timeout=None):
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     with db() as conn:
@@ -259,10 +273,12 @@ def create_job(targets, ports, icmp_count, devices_req, note):
         num = (row[0] or 0) + 1
         conn.execute(
             "INSERT INTO jobs (id, num, created_at, updated_at, status, note, "
-            "targets, ports, icmp_count, devices_req) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "targets, ports, icmp_count, devices_req, icmp_timeout_ms, "
+            "tcp_timeout) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, num, now, now, "queued", note or "",
              json.dumps(targets), json.dumps(ports), icmp_count,
-             json.dumps(devices_req) if devices_req else None),
+             json.dumps(devices_req) if devices_req else None,
+             icmp_timeout_ms, tcp_timeout),
         )
     return job_id, num
 
@@ -282,6 +298,8 @@ def job_to_dict(conn, job_id, with_results=True):
         "targets": json.loads(row["targets"]),
         "ports": json.loads(row["ports"]),
         "icmp_count": row["icmp_count"],
+        "icmp_timeout_ms": row["icmp_timeout_ms"],
+        "tcp_timeout": row["tcp_timeout"],
         "devices_req": json.loads(row["devices_req"]) if row["devices_req"] else None,
         "agent_id": row["agent_id"],
         "error": row["error"],
@@ -316,7 +334,7 @@ def job_to_csv(job):
     w = csv.writer(buf, delimiter=";", lineterminator="\n")
     w.writerow([
         "job_num", "job_id", "created_at", "note",
-        "device", "device_num", "operator", "ssid", "device_status", "egress_ip",
+        "device", "device_num", "operator", "link", "ssid", "device_status", "egress_ip",
         "egress_operator", "egress_ok", "local_ip",
         "target", "resolved_ip",
         "icmp_sent", "icmp_recv", "loss_pct", "rtt_min_ms", "rtt_avg_ms",
@@ -340,7 +358,7 @@ def job_to_csv(job):
             base = [
                 job.get("num"), job.get("id"), created, job.get("note"),
                 device, d.get("num") or "", d.get("operator") or "",
-                d.get("ssid") or "",
+                d.get("link") or "", d.get("ssid") or "",
                 d.get("status") or "", d.get("egress_ip") or "",
                 d.get("egress_info") or "",
                 1 if d.get("egress_ok") else 0, d.get("local_ip") or "",
@@ -553,7 +571,13 @@ class Handler(BaseHTTPRequestHandler):
             devices_req = [d for d in re.split(r"[\s,;]+", devices_req) if d]
         note = str(data.get("note") or "")[:200]
 
-        job_id, num = create_job(targets, ports, icmp_count, devices_req, note)
+        # Таймауты решают скорость: молчащая цель держит поток
+        # icmp_count x icmp_timeout, и на сотне целей разница драматическая.
+        icmp_timeout_ms = clamp_num(data.get("icmp_timeout_ms"), 200, 5000, int)
+        tcp_timeout = clamp_num(data.get("tcp_timeout"), 0.3, 10.0, float)
+
+        job_id, num = create_job(targets, ports, icmp_count, devices_req, note,
+                                 icmp_timeout_ms, tcp_timeout)
         return self._json(201, {"job_id": job_id, "num": num,
                                 "url": "/j/" + job_id})
 
@@ -682,12 +706,13 @@ class Handler(BaseHTTPRequestHandler):
                             (job_id,)).fetchone() is None:
                 return self._err(404, "задание не найдено")
             conn.execute(
-                "INSERT INTO device_runs (job_id, device, operator, num, status, "
-                "ssid, bssid, signal, local_ip, gateway, egress_ip, egress_info, "
-                "egress_ok, started_at, finished_at, error) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "INSERT INTO device_runs (job_id, device, operator, num, link, "
+                "status, ssid, bssid, signal, local_ip, gateway, egress_ip, "
+                "egress_info, egress_ok, started_at, finished_at, error) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(job_id, device) DO UPDATE SET "
                 "operator=excluded.operator, num=excluded.num, "
+                "link=excluded.link, "
                 "status=excluded.status, ssid=excluded.ssid, bssid=excluded.bssid, "
                 "signal=excluded.signal, local_ip=excluded.local_ip, "
                 "gateway=excluded.gateway, egress_ip=excluded.egress_ip, "
@@ -695,7 +720,7 @@ class Handler(BaseHTTPRequestHandler):
                 "started_at=excluded.started_at, finished_at=excluded.finished_at, "
                 "error=excluded.error",
                 (job_id, device, str(data.get("operator") or "")[:64] or None,
-                 data.get("num"),
+                 data.get("num"), str(data.get("link") or "")[:8] or None,
                  str(data.get("status") or "done")[:16],
                  data.get("ssid"), data.get("bssid"), data.get("signal"),
                  data.get("local_ip"), data.get("gateway"), data.get("egress_ip"),

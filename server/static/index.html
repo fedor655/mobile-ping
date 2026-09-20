@@ -30,8 +30,12 @@
         <input type="text" id="ports" value="443,80">
       </div>
       <div>
-        <label for="icmp">ICMP-пакетов на цель</label>
-        <input type="number" id="icmp" value="4" min="1" max="10">
+        <label for="mode">Режим</label>
+        <select id="mode">
+          <option value="full" selected>точный — 4 пакета, ждать 2 с</option>
+          <option value="fast">быстрый — 2 пакета, ждать 1 с</option>
+          <option value="sweep">обзорный — 1 пакет, ждать 0.5 с</option>
+        </select>
       </div>
       <div>
         <label for="note">Пометка (необязательно)</label>
@@ -59,6 +63,15 @@
 </div>
 <script src="/static/common.js"></script>
 <script>
+// Скорость упирается не в канал, а в таймауты: молчащая цель держит поток
+// icmp_count x icmp_timeout. Отсюда три готовых набора — от точного замера
+// задержек до быстрого «жив или нет» по длинному списку.
+const MODES = {
+  full:  { icmp_count: 4, icmp_timeout_ms: 2000, tcp_timeout: 3.0 },
+  fast:  { icmp_count: 2, icmp_timeout_ms: 1000, tcp_timeout: 1.5 },
+  sweep: { icmp_count: 1, icmp_timeout_ms: 500,  tcp_timeout: 1.0 },
+};
+
 async function loadAgents() {
   const box = document.getElementById('devices');
   let agents;
@@ -132,7 +145,9 @@ document.getElementById('f').addEventListener('submit', async (ev) => {
     const res = await postJSON('/api/jobs', {
       targets: document.getElementById('targets').value,
       ports: document.getElementById('ports').value,
-      icmp_count: document.getElementById('icmp').value,
+      icmp_count: MODES[document.getElementById('mode').value].icmp_count,
+      icmp_timeout_ms: MODES[document.getElementById('mode').value].icmp_timeout_ms,
+      tcp_timeout: MODES[document.getElementById('mode').value].tcp_timeout,
       note: document.getElementById('note').value,
       devices: (boxes.length && checked.length < boxes.length) ? checked : null,
     });
