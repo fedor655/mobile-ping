@@ -254,7 +254,26 @@ def icmp_ping(dest_ip, src_ip, count=4, timeout_ms=2000, payload=32,
     }
 
 
-def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None):
+# Настоящая привязка к интерфейсу в Windows. В отличие от выбора исходного
+# адреса, она заставляет ядро отправить пакет именно через этот интерфейс,
+# минуя обычный выбор маршрута — то есть переживает и полнотуннельный VPN,
+# который ставит маршруты 0.0.0.0/1 поверх всего.
+IP_UNICAST_IF = 31
+
+
+def bind_to_interface(sock, if_index):
+    """Жёстко назначить исходящий интерфейс. Индекс — в сетевом порядке байт."""
+    if not if_index:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF,
+                        struct.pack("!I", int(if_index)))
+    except OSError:
+        pass          # не поддержано — остаётся привязка по адресу
+
+
+def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None,
+              if_index=None):
     """
     TCP-рукопожатие с привязкой к src_ip.
 
@@ -268,6 +287,7 @@ def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
+        bind_to_interface(s, if_index)
         s.bind((src_ip, 0))
         t0 = time.perf_counter()
         s.connect((dest_ip, port))
@@ -311,7 +331,7 @@ def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None):
 
 def probe_many(targets, src_ip, ports=(443, 80), icmp_count=4,
                icmp_timeout_ms=2000, tcp_timeout=3.0,
-               parallel_icmp=500, parallel_tcp=64):
+               parallel_icmp=500, parallel_tcp=64, if_index=None):
     """
     Замер списка целей в две фазы с разной параллельностью.
 
@@ -359,7 +379,8 @@ def probe_many(targets, src_ip, ports=(443, 80), icmp_count=4,
         for port in r["_ports"]:
             r["tcp"].append(tcp_check(
                 r["resolved_ip"], port, src_ip, timeout=tcp_timeout,
-                server_hostname=r["_host"] if r["_is_name"] else None))
+                server_hostname=r["_host"] if r["_is_name"] else None,
+                if_index=if_index))
 
     if live:
         n = max(1, min(int(parallel_icmp), len(live), 2048))
@@ -411,9 +432,23 @@ def probe_target(target, src_ip, ports=(443, 80), icmp_count=4,
 # определение внешнего IP через конкретный интерфейс
 # --------------------------------------------------------------------------
 
-def _http_get(host, path, src_ip, timeout=8, port=80):
+def _http_get(host, path, src_ip, timeout=8, port=80, if_index=None):
     conn = http.client.HTTPConnection(host, port, timeout=timeout,
                                       source_address=(src_ip, 0))
+    if if_index:
+        # HTTPConnection создаёт сокет сам, поэтому подменяем его создателя
+        orig = conn._create_connection
+
+        def create(address, timeout=timeout, source_address=None, **kw):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            bind_to_interface(sock, if_index)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(address)
+            return sock
+
+        conn._create_connection = create
     try:
         conn.request("GET", path, headers={"User-Agent": "mobile-ping/1.0",
                                            "Connection": "close"})
@@ -425,7 +460,7 @@ def _http_get(host, path, src_ip, timeout=8, port=80):
         conn.close()
 
 
-def _operator_of(ip, src_ip, timeout):
+def _operator_of(ip, src_ip, timeout, if_index=None):
     """
     Чей это диапазон. Спрашиваем публичный справочник ip-api.com — он отдаёт
     владельца по базам RIPE, отсюда и «PJSC Vimpelcom · Russia».
@@ -435,7 +470,7 @@ def _operator_of(ip, src_ip, timeout):
     """
     try:
         body = _http_get("ip-api.com", "/json/%s?fields=country,isp" % ip,
-                         src_ip, timeout)
+                         src_ip, timeout, if_index=if_index)
         if body:
             d = json.loads(body)
             return " · ".join(x for x in (d.get("isp"), d.get("country")) if x)[:120]
@@ -444,7 +479,8 @@ def _operator_of(ip, src_ip, timeout):
     return ""
 
 
-def egress_info(src_ip, own_server=None, timeout=3, budget=8):
+def egress_info(src_ip, own_server=None, timeout=3, budget=8,
+                if_index=None):
     """
     Узнать, с какого внешнего адреса виден трафик, уходящий с src_ip.
 
@@ -465,14 +501,15 @@ def egress_info(src_ip, own_server=None, timeout=3, budget=8):
         try:
             host, _, port = own_server.partition(":")
             body = _http_get(host, "/api/whoami", src_ip, left(),
-                             int(port) if port else 80)
+                             int(port) if port else 80, if_index=if_index)
             if body:
                 ip = json.loads(body).get("ip")
                 if ip:
                     # адрес уже знаем точно; название оператора — по желанию,
                     # на него тратим не больше пары секунд
                     return {"ip": ip,
-                            "info": _operator_of(ip, src_ip, min(3.0, left()))
+                            "info": _operator_of(ip, src_ip, min(3.0, left()),
+                                                 if_index)
                                     if left() > 0 else ""}
         except (OSError, ValueError):
             pass
@@ -481,7 +518,7 @@ def egress_info(src_ip, own_server=None, timeout=3, budget=8):
     if left() > 0:
         try:
             body = _http_get("ip-api.com", "/json/?fields=query,country,isp,as",
-                             src_ip, left())
+                             src_ip, left(), if_index=if_index)
             if body:
                 d = json.loads(body)
                 if d.get("query"):
@@ -496,7 +533,7 @@ def egress_info(src_ip, own_server=None, timeout=3, budget=8):
         if left() <= 0:
             break
         try:
-            body = _http_get(host, path, src_ip, left())
+            body = _http_get(host, path, src_ip, left(), if_index=if_index)
             if body and len(body) < 60:
                 return {"ip": body.strip(), "info": ""}
         except OSError:

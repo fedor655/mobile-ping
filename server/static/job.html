@@ -38,7 +38,7 @@
 </div>
 
 <div class="card">
-  <h2>Журнал агента <span class="tiny" id="logcount"></span></h2>
+  <h2>весь журнал агента:</h2>
   <div class="logbox" id="logs"><span class="empty">пока пусто</span></div>
   <label class="logfoot">
     <input type="checkbox" id="follow" checked> следить за концом
@@ -231,8 +231,6 @@ let lastLogCount = -1;
 
 function renderLogs(logs) {
   const box = document.getElementById('logs');
-  document.getElementById('logcount').textContent =
-    logs.length ? '— ' + logs.length + ' строк, весь целиком' : '';
   if (!logs.length) {
     box.innerHTML = '<span class="empty">агент ещё ничего не написал</span>';
     return;

@@ -63,9 +63,14 @@ DEFAULTS = {
     # телефона, и её размер невелик. Замер на Билайне: до 192 потоков неудач
     # нет, на 320 их уже 45%, на 500 — две трети. То есть выше порога замер
     # начинает врать про закрытые порты, а это худший вид ошибки: цифры идут,
-    # выглядят правдоподобно и неверны. Берём с запасом вдвое от порога;
-    # найти свой для каждого телефона умеет bench.py.
-    "parallel_tcp": 128,
+    # выглядят правдоподобно и неверны.
+    #
+    # Значение выбрано по замеру стабильной скорости, а не по одному пику:
+    # на 64 потоках разброс между прогонами невелик, выше он становится
+    # трёхкратным. TLS-фаза самая медленная и она же определяет время полного
+    # замера — на 64 потоках это 330 проверок в секунду по проводу, 140 через
+    # телефон по кабелю и около 100 через его Wi-Fi.
+    "parallel_tcp": 64,
     "known_non_mobile_ips": [],
 }
 
@@ -201,13 +206,14 @@ class Client:
 # --------------------------------------------------------------------------
 
 def measure(targets, src_ip, ports, icmp_count, icmp_timeout_ms, tcp_timeout,
-            parallel_icmp, parallel_tcp):
+            parallel_icmp, parallel_tcp, if_index=None):
     """Прогнать список целей. Порядок результатов сохраняется."""
     try:
         return probe.probe_many(
             targets, src_ip, ports=ports, icmp_count=icmp_count,
             icmp_timeout_ms=icmp_timeout_ms, tcp_timeout=tcp_timeout,
-            parallel_icmp=parallel_icmp, parallel_tcp=parallel_tcp)
+            parallel_icmp=parallel_icmp, parallel_tcp=parallel_tcp,
+            if_index=if_index)
     except Exception as exc:
         return [{"target": t, "error": "сбой замера: %s" % str(exc)[:80],
                  "tcp": []} for t in targets]
@@ -383,7 +389,7 @@ class Agent:
             log("не удалось закрыть задание: %s" % str(exc)[:100])
         stop_capture()
 
-    def check_egress(self, payload, src_ip, not_mobile):
+    def check_egress(self, payload, src_ip, not_mobile, if_index=None):
         """
         Убедиться, что с этого адреса мы выходим именно в мобильную сеть.
 
@@ -391,7 +397,8 @@ class Agent:
         приватный внешний адрес означает перехват туннелем, совпадение с
         домашним — что канал вообще не тот. Общее для кабеля и Wi-Fi.
         """
-        eg = probe.egress_info(src_ip, own_server=self.server_host())
+        eg = probe.egress_info(src_ip, own_server=self.server_host(),
+                               if_index=if_index)
         egress_ip = eg.get("ip")
         payload["egress_ip"] = egress_ip
         payload["egress_info"] = eg.get("info")
@@ -427,14 +434,15 @@ class Agent:
         log("  внешний IP определить не удалось — за точкой нет интернета")
         return True
 
-    def measure_into(self, payload, src_ip, targets, ports, icmp_count, job):
+    def measure_into(self, payload, src_ip, targets, ports, icmp_count, job,
+                     if_index=None):
         """Прогнать цели и разложить результат. Общее для кабеля и Wi-Fi."""
         started = payload["started_at"]
         payload["results"] = measure(
             targets, src_ip, ports, icmp_count,
             job.get("icmp_timeout_ms") or self.cfg["icmp_timeout_ms"],
             job.get("tcp_timeout") or self.cfg["tcp_timeout"],
-            self.cfg["parallel"], self.cfg["parallel_tcp"])
+            self.cfg["parallel"], self.cfg["parallel_tcp"], if_index)
 
         # Если замер развалился из-за исходного адреса, это сбой устройства, а
         # не приговор целям: показывать такое как «не отвечает» нельзя.
@@ -524,10 +532,11 @@ class Agent:
             payload.update(error="адрес %s не годится для замера" % src_ip,
                            finished_at=time.time())
             return payload
-        if not self.check_egress(payload, src_ip, not_mobile):
+        if not self.check_egress(payload, src_ip, not_mobile,
+                                 adapter["index"]):
             return payload
         return self.measure_into(payload, src_ip, targets, ports, icmp_count,
-                                 job)
+                                 job, adapter["index"])
 
     def run_wifi_device(self, dev, job, targets, ports, icmp_count, not_mobile,
                         num=None):
@@ -569,7 +578,8 @@ class Agent:
         log("  подключён: IP %s, шлюз %s, сигнал %s"
             % (src_ip, gw, payload["signal"]))
 
-        if not self.check_egress(payload, src_ip, not_mobile):
+        if not self.check_egress(payload, src_ip, not_mobile,
+                                 self.adapter["index"]):
             return payload
 
         # Адрес мог смениться, пока ходили за внешним IP: Wi-Fi только что
@@ -589,7 +599,7 @@ class Agent:
                 return payload
 
         return self.measure_into(payload, src_ip, targets, ports, icmp_count,
-                                 job)
+                                 job, self.adapter["index"])
 
     # -- главный цикл ----------------------------------------------------
 

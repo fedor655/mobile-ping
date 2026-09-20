@@ -40,7 +40,7 @@
   "icmp_timeout_ms": 2000,
   "tcp_timeout": 3.0,
   "parallel": 500,
-  "parallel_tcp": 128,
+  "parallel_tcp": 64,
   "_parallel": "parallel — потоки для ICMP, parallel_tcp — для TCP и TLS. Разные потому, что ICMP канал держит тысячами в секунду, а каждое TCP-соединение занимает запись в NAT телефона и выше порога соединения начинают отваливаться. Свой порог для телефона показывает python bench.py --adapter <адаптер>.",
 
   "known_non_mobile_ips": [],
