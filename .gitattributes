@@ -1,0 +1,5 @@
+# Скрипты и код запускаются в том числе на Linux, где CRLF ломает bash
+# («\r: command not found»). Храним и выдаём их только с LF.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.json text eol=lf

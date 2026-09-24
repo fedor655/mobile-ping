@@ -1,69 +1,51 @@
 # -*- coding: utf-8 -*-
 """
-probe.py — собственно замеры: ICMP и TCP, всегда с привязкой к нужному интерфейсу.
+probe.py — собственно замеры: ICMP, TCP и TLS, всегда с привязкой к нужному
+интерфейсу. Часть, общая для Windows и Linux; сам ICMP живёт в icmp_windows.py
+и icmp_linux.py.
 
-Главная мысль файла. На ноутбуке одновременно живут кабель, Wi-Fi и VPN-туннели.
-У WireGuard маршруты 0.0.0.0/1 и 128.0.0.0/1 — они перехватывают вообще весь
-трафик, а Ethernet имеет метрику лучше, чем Wi-Fi. Поэтому обычный `ping 1.1.1.1`
-уходит куда угодно, но не в мобильную сеть телефона. Именно на этом ломалась
-прошлая версия.
+Главная мысль файла. На машине одновременно живут кабель, Wi-Fi, несколько
+телефонов по USB и VPN-туннели. У полнотуннельного VPN маршруты 0.0.0.0/1 и
+128.0.0.0/1 перехватывают вообще весь трафик. Поэтому обычный `ping 1.1.1.1`
+уходит куда угодно, но не в мобильную сеть нужного телефона. Именно на этом
+ломалась первая версия проекта.
 
-Лечение — не правка маршрутов (это роняет сеть), а привязка каждого замера к
-исходному адресу Wi-Fi-адаптера:
-  * ICMP — IcmpSendEcho2Ex, у неё есть параметр SourceAddress;
-  * TCP  — обычный сокет с bind((src_ip, 0)) до connect.
-Windows использует strong host model, поэтому пакет с исходным адресом Wi-Fi
-обязан уйти именно через Wi-Fi.
+Лечение — не правка маршрутов (это роняет сеть целиком), а привязка каждого
+замера к устройству:
 
-IcmpSendEcho2Ex выбрана вместо raw-сокета ещё и потому, что не требует прав
-администратора, и вместо разбора вывода ping.exe — потому что тот локализован.
+  * TCP и TLS — сокет с IP_UNICAST_IF, то есть жёстким назначением исходящего
+    интерфейса, плюс bind() на его адрес;
+  * ICMP под Linux — то же самое, ping-сокет тоже принимает IP_UNICAST_IF;
+  * ICMP под Windows — только исходный адрес: у IcmpSendEcho2Ex параметра для
+    интерфейса нет. Эта щель закрывается проверкой icmp_will_leak(), которая
+    спрашивает у ядра, куда оно отправило бы пакет на самом деле.
 """
 
-import ctypes
-import ctypes.wintypes as wt
 import http.client
 import json
 import ipaddress
 import socket
 import ssl
+import sys
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-iphlpapi = ctypes.WinDLL("iphlpapi.dll")
-kernel32 = ctypes.WinDLL("kernel32.dll")
+from consts import SOURCE_INVALID
 
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-# Коды IP_STATUS из ipexport.h — переводим в человеческие формулировки.
-IP_STATUS = {
-    0: "ok",
-    11001: "буфер мал",
-    11002: "сеть недостижима",
-    11003: "узел недостижим",
-    11004: "протокол недостижим",
-    11005: "порт недостижим",
-    11006: "нет ресурсов",
-    11007: "плохая опция",
-    11008: "аппаратная ошибка",
-    11009: "пакет слишком велик",
-    11010: "таймаут",
-    11011: "неверный запрос",
-    11012: "нет маршрута",
-    11013: "TTL истёк в пути",
-    11014: "TTL истёк при сборке",
-    11015: "проблема с параметром",
-    11016: "source quench",
-    11017: "опция слишком велика",
-    11018: "неверный адрес назначения",
-    11050: "общий сбой",
-}
-
-# Когда IcmpSendEcho2Ex не отправила ни одного пакета, GetLastError отдаёт не
-# IP_STATUS, а обычный код Windows. Чаще всего это значит, что с указанного
-# исходного адреса до цели просто нет маршрута — например, телефон раздаёт
-# Wi-Fi, но сам в интернет не выходит.
-SOURCE_INVALID = "исходный адрес недоступен"
+if sys.platform == "win32":
+    from icmp_windows import icmp_ping          # noqa: F401
+    # Номер опции «отправлять через этот интерфейс» в Windows.
+    IP_UNICAST_IF = 31
+    # У IcmpSendEcho2Ex параметра для интерфейса нет — только исходный адрес,
+    # поэтому маршрут выбирает ядро и пинги могут уйти мимо устройства.
+    ICMP_BOUND_TO_INTERFACE = False
+else:
+    from icmp_linux import icmp_ping            # noqa: F401
+    IP_UNICAST_IF = 50
+    # Ping-сокет принимает IP_UNICAST_IF, то есть ICMP прибивается к
+    # интерфейсу так же жёстко, как TCP, и щели тут нет.
+    ICMP_BOUND_TO_INTERFACE = True
 
 # Порты, на которых осмысленно пробовать TLS-рукопожатие.
 TLS_PORTS = (443, 8443, 993, 995, 465)
@@ -74,11 +56,11 @@ def _make_tls_context():
     Контекст для рукопожатия, создаётся один раз на процесс.
 
     Проверка подлинности сертификата выключена намеренно: мы выясняем, дают ли
-    нам вообще завершить рукопожатие, а не доверяем ли мы собеседнику.
-    Из-за этого не нужно и хранилище сертификатов — а именно его загрузка в
-    ssl.create_default_context() стоит 23 мс на вызов под Windows и держит
-    GIL. Пока контекст создавался на каждую проверку, TLS упирался в 42
-    проверки в секунду на любом канале, хоть на мобильном, хоть на проводе.
+    нам вообще завершить рукопожатие, а не доверяем ли мы собеседнику. Из-за
+    этого не нужно и хранилище сертификатов — а именно его загрузка в
+    ssl.create_default_context() стоит 23 мс на вызов под Windows и держит GIL.
+    Пока контекст создавался на каждую проверку, TLS упирался в 42 проверки в
+    секунду на любом канале.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -88,34 +70,38 @@ def _make_tls_context():
 
 _TLS_CTX = _make_tls_context()
 
-WIN32_STATUS = {
-    87: "неверный параметр",
-    # 1214 приходит, когда исходного адреса уже нет на адаптере: Wi-Fi
-    # переподключился и DHCP ещё не выдал новый. Это не «цель недоступна»,
-    # а признак того, что замера не было вовсе.
-    1214: SOURCE_INVALID,
-    1231: "сеть недоступна",
-    1232: "узел недоступен",
-    10049: SOURCE_INVALID,
-    10065: "узел недостижим",
-}
+
+def bind_to_interface(sock, if_index):
+    """
+    Жёстко назначить исходящий интерфейс. Индекс — в сетевом порядке байт.
+
+    В отличие от выбора исходного адреса, это не подсказка, а приказ: пакет
+    уйдёт через указанный интерфейс мимо обычного выбора маршрута, поэтому
+    переживает и полнотуннельный VPN с маршрутами 0.0.0.0/1.
+    """
+    if not if_index:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF,
+                        struct.pack("!I", int(if_index)))
+    except OSError:
+        pass          # не поддержано — остаётся привязка по адресу
 
 
 def route_source_for(dest_ip):
     """
-    Какой исходный адрес Windows выбрала бы для этой цели по своим маршрутам.
+    Какой исходный адрес система выбрала бы для этой цели по своим маршрутам.
 
     UDP-сокет, подключённый к адресу, не отправляет ни одного пакета, но ядро
-    уже выбирает маршрут — и getsockname() отдаёт адрес того интерфейса,
-    через который трафик ушёл бы на самом деле.
+    уже выбирает маршрут — и getsockname() отдаёт адрес того интерфейса, через
+    который трафик ушёл бы на самом деле.
 
-    Нужно это для ICMP. TCP мы прибиваем к интерфейсу жёстко (IP_UNICAST_IF),
-    а у IcmpSendEcho2Ex такой возможности нет — есть только исходный адрес,
-    и маршрут всё равно выбирает ядро. Сравнив выбор ядра с нашим интерфейсом,
-    можно заранее увидеть, что пинги уйдут не туда: именно так полнотуннельный
-    VPN однажды увёл замер мимо телефона.
+    Нужно это для ICMP под Windows: там у IcmpSendEcho2Ex есть только исходный
+    адрес, привязки к интерфейсу нет, и маршрут всё равно выбирает ядро. Под
+    Linux ICMP прибивается к интерфейсу на уровне сокета, но проверка полезна и
+    там — как независимое подтверждение.
 
-    Прав администратора не требует и ничего в сеть не посылает.
+    Прав не требует и ничего в сеть не посылает.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -133,9 +119,62 @@ def icmp_will_leak(src_ip, dest_ip="1.1.1.1"):
 
     Возвращает адрес, который выберет ядро, если он отличается от нашего,
     иначе None. Отличие — повод не доверять пингам с этого устройства.
+
+    Там, где ICMP прибивается к интерфейсу на уровне сокета (Linux), выбор
+    ядра по маршрутам ни на что не влияет, и проверка всегда возвращает None:
+    иначе любое устройство, не являющееся маршрутом по умолчанию, отбраковы-
+    валось бы зря — а это как раз обычное положение дел, когда телефонов
+    несколько.
     """
+    if ICMP_BOUND_TO_INTERFACE:
+        return None
     chosen = route_source_for(dest_ip)
     return chosen if (chosen and chosen != src_ip) else None
+
+
+# Адрес из RFC 5737 (TEST-NET-1): не маршрутизируется нигде в мире. Честный
+# путь не может ни установить с ним TCP-соединение, ни получить ответ на ping.
+CANARY_IP = "192.0.2.1"
+
+
+def interception_check(src_ip, if_index=None, timeout=2.0):
+    """
+    Не подделывает ли кто-то трафик на этом пути.
+
+    Стучимся в адрес, которого не существует. Если TCP «соединился» или ping
+    «ответил» — значит, между нами и сетью стоит прокси или VPN в режиме TUN,
+    который сам завершает соединения. Так работает, например, sing-box с
+    auto_redirect: он перехватывает TCP на уровне netfilter, и никакая
+    привязка к интерфейсу, даже IP_UNICAST_IF, его не обходит.
+
+    Через такой путь любой порт выглядит открытым, а любой адрес — живым,
+    поэтому замеры с него недействительны целиком. Найдено на боевой машине:
+    23 несуществующих адреса из 30 показали «TCP открыт».
+
+    Возвращает None, если всё честно, иначе описание того, что не так.
+    """
+    def tcp_probe():
+        return tcp_check(CANARY_IP, 443, src_ip, timeout=timeout,
+                         if_index=if_index)
+
+    def icmp_probe():
+        return icmp_ping(CANARY_IP, src_ip, count=1,
+                         timeout_ms=int(timeout * 1000), gap_sec=0,
+                         if_index=if_index)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        t, p = pool.submit(tcp_probe), pool.submit(icmp_probe)
+        tcp, ping = t.result(), p.result()
+
+    if tcp.get("ok"):
+        return ("TCP-соединение с несуществующим адресом %s установилось за "
+                "%.0f мс — TCP на этом пути перехватывает прокси или VPN "
+                "(например, sing-box в режиме TUN). Любой порт через него "
+                "выглядит открытым." % (CANARY_IP, tcp.get("ms") or 0))
+    if ping.get("recv"):
+        return ("на ping несуществующего адреса %s пришёл ответ — ICMP на этом "
+                "пути подделывает прокси или VPN." % CANARY_IP)
+    return None
 
 
 def is_public_ip(ip):
@@ -176,46 +215,6 @@ def result_is_invalid(res):
     return bool(tcp) and all(t.get("error") == SOURCE_INVALID for t in tcp)
 
 
-def _status_text(code):
-    if code in IP_STATUS:
-        return IP_STATUS[code]
-    if code in WIN32_STATUS:
-        return WIN32_STATUS[code]
-    return "код %d" % code
-
-
-class IP_OPTION_INFORMATION(ctypes.Structure):
-    _fields_ = [("Ttl", ctypes.c_ubyte),
-                ("Tos", ctypes.c_ubyte),
-                ("Flags", ctypes.c_ubyte),
-                ("OptionsSize", ctypes.c_ubyte),
-                ("OptionsData", ctypes.POINTER(ctypes.c_ubyte))]
-
-
-class ICMP_ECHO_REPLY(ctypes.Structure):
-    _fields_ = [("Address", wt.ULONG),
-                ("Status", wt.ULONG),
-                ("RoundTripTime", wt.ULONG),
-                ("DataSize", ctypes.c_ushort),
-                ("Reserved", ctypes.c_ushort),
-                ("Data", ctypes.c_void_p),
-                ("Options", IP_OPTION_INFORMATION)]
-
-
-iphlpapi.IcmpCreateFile.restype = ctypes.c_void_p
-iphlpapi.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
-iphlpapi.IcmpSendEcho2Ex.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    wt.ULONG, wt.ULONG, ctypes.c_void_p, ctypes.c_ushort,
-    ctypes.POINTER(IP_OPTION_INFORMATION), ctypes.c_void_p, wt.DWORD, wt.DWORD]
-iphlpapi.IcmpSendEcho2Ex.restype = wt.DWORD
-
-
-def _ipaddr(ip_str):
-    """'1.2.3.4' -> ULONG в сетевом порядке, как ждёт IPAddr."""
-    return struct.unpack("<I", socket.inet_aton(ip_str))[0]
-
-
 def resolve(host):
     """Имя -> IPv4. Для голого IP возвращает его же."""
     try:
@@ -234,79 +233,6 @@ def split_target(target):
         if port.isdigit():
             return host, int(port)
     return target, None
-
-
-def icmp_ping(dest_ip, src_ip, count=4, timeout_ms=2000, payload=32,
-              gap_sec=0.2):
-    """
-    Пинг с жёстко заданным исходным адресом.
-
-    Возвращает dict: sent, recv, rtt_min/avg/max (мс), status (текст последнего
-    неуспеха), replies — список статусов по попыткам.
-    """
-    handle = iphlpapi.IcmpCreateFile()
-    if handle == INVALID_HANDLE_VALUE or not handle:
-        raise OSError("IcmpCreateFile не удалось")
-
-    data = b"mobile-ping" + b"." * max(0, payload - 11)
-    req = ctypes.create_string_buffer(data, len(data))
-    reply_size = ctypes.sizeof(ICMP_ECHO_REPLY) + len(data) + 64
-    reply = ctypes.create_string_buffer(reply_size)
-
-    src = _ipaddr(src_ip)
-    dst = _ipaddr(dest_ip)
-
-    rtts, statuses = [], []
-    try:
-        for i in range(count):
-            if i:
-                time.sleep(gap_sec)
-            n = iphlpapi.IcmpSendEcho2Ex(
-                handle, None, None, None, src, dst,
-                ctypes.cast(req, ctypes.c_void_p), ctypes.c_ushort(len(data)),
-                None, ctypes.cast(reply, ctypes.c_void_p),
-                reply_size, int(timeout_ms))
-            if n:
-                r = ctypes.cast(reply,
-                                ctypes.POINTER(ICMP_ECHO_REPLY)).contents
-                st = int(r.Status)
-                statuses.append(_status_text(st))
-                if st == 0:
-                    rtts.append(float(r.RoundTripTime))
-            else:
-                st = kernel32.GetLastError()
-                statuses.append(_status_text(st))
-    finally:
-        iphlpapi.IcmpCloseHandle(handle)
-
-    bad = [s for s in statuses if s != "ok"]
-    return {
-        "sent": count,
-        "recv": len(rtts),
-        "rtt_min": min(rtts) if rtts else None,
-        "rtt_avg": sum(rtts) / len(rtts) if rtts else None,
-        "rtt_max": max(rtts) if rtts else None,
-        "status": (bad[-1] if bad else "ok"),
-        "replies": statuses,
-    }
-
-
-# Настоящая привязка к интерфейсу в Windows. В отличие от выбора исходного
-# адреса, она заставляет ядро отправить пакет именно через этот интерфейс,
-# минуя обычный выбор маршрута — то есть переживает и полнотуннельный VPN,
-# который ставит маршруты 0.0.0.0/1 поверх всего.
-IP_UNICAST_IF = 31
-
-
-def bind_to_interface(sock, if_index):
-    """Жёстко назначить исходящий интерфейс. Индекс — в сетевом порядке байт."""
-    if not if_index:
-        return
-    try:
-        sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF,
-                        struct.pack("!I", int(if_index)))
-    except OSError:
-        pass          # не поддержано — остаётся привязка по адресу
 
 
 def tcp_check(dest_ip, port, src_ip, timeout=3.0, server_hostname=None,
@@ -470,8 +396,11 @@ def probe_target(target, src_ip, ports=(443, 80), icmp_count=4,
 # --------------------------------------------------------------------------
 
 def _http_get(host, path, src_ip, timeout=8, port=80, if_index=None):
-    conn = http.client.HTTPConnection(host, port, timeout=timeout,
-                                      source_address=(src_ip, 0))
+    # src_ip=None — без привязки: так снимается то, что видит маршрут по
+    # умолчанию, со всеми прокси и VPN, которые на нём стоят.
+    conn = http.client.HTTPConnection(
+        host, port, timeout=timeout,
+        source_address=(src_ip, 0) if src_ip else None)
     if if_index:
         # HTTPConnection создаёт сокет сам, поэтому подменяем его создателя
         orig = conn._create_connection

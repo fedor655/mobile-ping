@@ -33,7 +33,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import netinfo
 import probe
-import wifi_windows as wifi
+
+# Модуль Wi-Fi существует только под Windows: он построен на WLAN API и netsh.
+# Импортируем его лениво, чтобы агент запускался под Linux, где точки Wi-Fi
+# пока не поддерживаются, а телефоны подключаются кабелем.
+wifi = None
+if sys.platform == "win32":
+    import wifi_windows as wifi
 
 VERSION = "1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -228,11 +234,22 @@ class Agent:
     def __init__(self, cfg):
         self.cfg = cfg
         self.client = Client(cfg["server"], cfg["token"])
-        self.adapter = netinfo.wifi_adapter(cfg.get("wifi_adapter"))
-        self.adapter_name = self.adapter["name"]
-        self.adapter_desc = self.adapter["description"]
-        log("Wi-Fi адаптер: %s (idx=%d, %s)"
-            % (self.adapter_name, self.adapter["index"], self.adapter_desc))
+        # Wi-Fi нужен, только если хоть одно устройство им пользуется. На
+        # машине без беспроводного адаптера это не должно мешать работе
+        # с телефонами на кабеле.
+        self.adapter = None
+        self.adapter_name = self.adapter_desc = None
+        if any(not is_usb(d) for d in cfg["devices"]):
+            if wifi is None:
+                raise SystemExit(
+                    "в настройках есть устройства по Wi-Fi, но переключение "
+                    "точек поддержано только под Windows. На Linux "
+                    "подключайте телефоны кабелем: link=usb.")
+            self.adapter = netinfo.wifi_adapter(cfg.get("wifi_adapter"))
+            self.adapter_name = self.adapter["name"]
+            self.adapter_desc = self.adapter["description"]
+            log("Wi-Fi адаптер: %s (idx=%d, %s)"
+                % (self.adapter_name, self.adapter["index"], self.adapter_desc))
 
         bad = netinfo.capturing_tunnels()
         if bad:
@@ -254,6 +271,8 @@ class Agent:
         return a["ipv4"][0] if a and a["ipv4"] else None
 
     def current_ssid(self):
+        if wifi is None or not self.adapter_desc:
+            return None
         conn = wifi.current(self.adapter_desc)
         return (conn or {}).get("ssid")
 
@@ -279,7 +298,7 @@ class Agent:
     def go_home(self):
         """Вернуться в обычную сеть. Вызывается в том числе из finally."""
         home = self.cfg["home"]
-        if not home.get("ssid"):
+        if wifi is None or not home.get("ssid"):
             return
         try:
             if self.current_ssid() == home["ssid"]:
@@ -290,19 +309,78 @@ class Agent:
         except Exception as exc:
             log("не удалось вернуться в %r: %s" % (home["ssid"], str(exc)[:160]))
 
-    def server_host(self):
-        base = self.cfg["server"].split("//", 1)[-1]
+    @staticmethod
+    def server_host_of(cfg):
+        base = cfg["server"].split("//", 1)[-1]
         return base.split("/", 1)[0]
 
-    def home_egress(self):
-        """Внешний IP в обычной сети — эталон «это не мобильный интернет»."""
-        try:
-            src = self.wifi_src_ip()
-            info = probe.egress_info(src, own_server=self.server_host()) \
-                if src else {"ip": None, "info": ""}
-            return info.get("ip")
-        except Exception:
-            return None
+    def server_host(self):
+        return self.server_host_of(self.cfg)
+
+    BASELINE_TTL = 600
+
+    def home_baseline(self, devices):
+        """
+        Внешние адреса всего, что не является телефоном, — эталон «это не
+        мобильный интернет».
+
+        Раньше эталон снимался только через Wi-Fi-адаптер. На машине без
+        Wi-Fi-устройств (Linux, одни телефоны на кабеле) его не было вовсе, и
+        проверка «не совпадает ли выход с домашним» молча отключалась. На
+        боевой машине это дало «мобильная сеть подтверждена» для телефона,
+        который раздавал домашний Wi-Fi.
+
+        Теперь адрес снимается через каждый интерфейс со шлюзом, кроме самих
+        телефонов, и отдельно через маршрут по умолчанию — со всеми прокси и
+        VPN, что на нём стоят. Результат кэшируется: домашний адрес меняется
+        редко, а замер стоит нескольких секунд.
+
+        Возвращает словарь {откуда: внешний IP}.
+        """
+        cached = getattr(self, "_baseline", None)
+        if cached and time.time() - cached[0] < self.BASELINE_TTL:
+            return cached[1]
+
+        phones = set()
+        for d in devices:
+            if is_usb(d):
+                for a in netinfo.match_adapters(d.get("adapter")):
+                    phones.add(a["name"])
+
+        paths = [("маршрут по умолчанию", None, None)]
+        for a in netinfo.adapters():
+            ip = netinfo.usable_ipv4(a)
+            if (a["up"] and ip and a["gateways"] and a["name"] not in phones
+                    and not ip.startswith("127.")):
+                paths.append((a["name"], ip, a["index"]))
+
+        def one(path):
+            label, src, idx = path
+            try:
+                eg = probe.egress_info(src, own_server=self.server_host(),
+                                       if_index=idx, timeout=3, budget=5)
+                return label, eg.get("ip")
+            except Exception:
+                return label, None
+
+        with ThreadPoolExecutor(max_workers=len(paths)) as pool:
+            found = {label: ip for label, ip in pool.map(one, paths) if ip}
+
+        self._baseline = (time.time(), found)
+        return found
+
+    def baseline_to_set(self, devices):
+        """Эталон одним множеством и запись в журнал — общее для двух режимов."""
+        not_mobile = set(self.cfg.get("known_non_mobile_ips") or [])
+        base = self.home_baseline(devices)
+        for label, ip in sorted(base.items()):
+            log("внешний IP обычной сети (%s): %s" % (label, ip))
+            not_mobile.add(ip)
+        if not base:
+            log("ВНИМАНИЕ: внешний IP обычной сети не снялся ни через один "
+                "интерфейс — проверка «не домашний ли это выход» не работает, "
+                "и телефон, раздающий домашний Wi-Fi, не будет отбракован")
+        return not_mobile
 
     # -- выполнение задания ---------------------------------------------
 
@@ -321,11 +399,7 @@ class Agent:
             self.client.complete(job["id"], error="нет подходящих устройств")
             return
 
-        not_mobile = set(self.cfg.get("known_non_mobile_ips") or [])
-        home_ip = self.home_egress()
-        if home_ip:
-            not_mobile.add(home_ip)
-            log("внешний IP обычной сети: %s" % home_ip)
+        not_mobile = self.baseline_to_set(devices)
 
         numbered = list(enumerate(devices, start=1))
         by_usb = [(n, d) for n, d in numbered if is_usb(d)]
@@ -397,6 +471,16 @@ class Agent:
         приватный внешний адрес означает перехват туннелем, совпадение с
         домашним — что канал вообще не тот. Общее для кабеля и Wi-Fi.
         """
+        # Сначала — не подделывает ли кто-то трафик на этом пути вообще.
+        # Если да, дальнейшие проверки бессмысленны: прокси ответит за кого
+        # угодно, в том числе и за наш сервер.
+        faked = probe.interception_check(src_ip, if_index)
+        if faked:
+            payload.update(status="error", finished_at=time.time(),
+                           error="замер недействителен: " + faked)
+            log("  ВНИМАНИЕ: %s Замер отменён." % faked)
+            return False
+
         # TCP мы прибиваем к интерфейсу жёстко, а ICMP — нет: у
         # IcmpSendEcho2Ex есть только исходный адрес, маршрут выбирает ядро.
         # Из-за этого возможна худшая комбинация: внешний IP подтверждается
@@ -663,19 +747,29 @@ def selftest(cfg):
     print("  " + (", ".join(t["name"] for t in tun) if tun else "нет"))
 
     print("\n=== Wi-Fi ===")
-    conn = wifi.current()
-    print("  " + (("%s (сигнал %s%%, BSSID %s)"
-                   % (conn.get("ssid"), conn.get("signal"), conn.get("bssid")))
-                  if conn and conn.get("ssid") else "не подключён"))
+    conn = wifi.current() if wifi else None
+    if wifi is None:
+        print("  переключение точек Wi-Fi поддержано только под Windows; "
+              "здесь телефоны подключаются кабелем")
+    else:
+        print("  " + (("%s (сигнал %s%%, BSSID %s)"
+                       % (conn.get("ssid"), conn.get("signal"),
+                          conn.get("bssid")))
+                      if conn and conn.get("ssid") else "не подключён"))
 
-    print("\n=== внешний IP по интерфейсам ===")
+    print("\n=== внешний IP и честность пути по интерфейсам ===")
     for a in netinfo.adapters():
-        if not (a["up"] and a["ipv4"] and a["gateways"]):
+        src = netinfo.usable_ipv4(a)
+        if not (a["up"] and src and a["gateways"]):
             continue
-        src = a["ipv4"][0]
-        eg = probe.egress_info(src, timeout=6)
-        print("  %-34s %-15s -> %s  %s"
-              % (a["name"][:34], src, eg["ip"] or "не определился", eg["info"]))
+        eg = probe.egress_info(src, own_server=Agent.server_host_of(cfg),
+                               if_index=a["index"], timeout=3, budget=6)
+        faked = probe.interception_check(src, a["index"], timeout=1.5)
+        print("  %-22s %-15s -> %-15s %s"
+              % (a["name"][:22], src, eg["ip"] or "не определился",
+                 eg["info"][:30]))
+        print("  %-22s %s" % ("", ("ПЕРЕХВАТ: " + faked) if faked
+                               else "путь честный: несуществующий адрес не отвечает"))
 
     print("\n=== настройки ===")
     print("  сервер:   %s" % cfg["server"])
@@ -739,11 +833,7 @@ def local_run(cfg, targets, ports, device_names=None):
     if not devices:
         raise SystemExit("подходящих устройств нет")
 
-    not_mobile = set(cfg.get("known_non_mobile_ips") or [])
-    home_ip = agent.home_egress()
-    if home_ip:
-        not_mobile.add(home_ip)
-        print("внешний IP обычной сети: %s" % home_ip)
+    not_mobile = agent.baseline_to_set(devices)
 
     fake_job = {"id": "local", "targets": targets, "ports": ports,
                 "icmp_count": cfg["icmp_count"], "icmp_timeout_ms": None,
