@@ -14,3 +14,5 @@ venv/
 
 .DS_Store
 Thumbs.db
+agent/agent.pid
+agent/agent.out
