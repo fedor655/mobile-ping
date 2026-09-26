@@ -486,15 +486,14 @@ class Agent:
         # Из-за этого возможна худшая комбинация: внешний IP подтверждается
         # (он проверяется по TCP и потому верен), а пинги тихо уходят в
         # туннель. Спрашиваем у ядра заранее, куда оно их отправит.
-        leak = probe.icmp_will_leak(src_ip)
+        leak = probe.icmp_will_leak(src_ip, [payload.get("gateway")])
         if leak:
             payload.update(status="error", finished_at=time.time(),
-                           error="ICMP уйдут не через это устройство: ядро "
-                                 "выбирает адрес %s. Обычно это поднятый "
-                                 "полнотуннельный VPN — отключите его на "
-                                 "машине агента." % leak)
-            log("  ВНИМАНИЕ: ядро отправит ICMP с адреса %s, а не %s — "
-                "замер отменён" % (leak, src_ip))
+                           error="ICMP уйдут не через это устройство: %s. "
+                                 "Обычно это поднятый полнотуннельный VPN — "
+                                 "отключите его на машине агента." % leak)
+            log("  ВНИМАНИЕ: ICMP уйдут не через устройство (%s) — "
+                "замер отменён" % leak)
             return False
 
         eg = probe.egress_info(src_ip, own_server=self.server_host(),

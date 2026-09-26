@@ -153,3 +153,41 @@ def icmp_ping(dest_ip, src_ip, count=4, timeout_ms=2000, payload=32,
         "status": (bad[-1] if bad else "ok"),
         "replies": statuses,
     }
+
+
+def first_hop(dest_ip, src_ip, timeout_ms=1500):
+    """
+    Кто первым ответит на пакет с этого адреса — то есть через какой шлюз
+    ICMP уходит на самом деле.
+
+    Отправляем эхо-запрос с TTL=1: первый же роутер на пути отбрасывает его и
+    присылает «TTL истёк в пути» от своего адреса. Если ответил шлюз телефона,
+    пинги идут через телефон; если домашний роутер или VPN — они утекают.
+
+    Это прямое измерение, а не догадка по таблице маршрутов: с заданным
+    исходным адресом Windows отправляет пакет только через интерфейс, которому
+    этот адрес принадлежит, даже если по умолчанию выбрала бы другой.
+
+    Возвращает (адрес ответившего или None, текст статуса).
+    """
+    handle = iphlpapi.IcmpCreateFile()
+    if handle == INVALID_HANDLE_VALUE or not handle:
+        return None, "IcmpCreateFile не удалось"
+    data = b"mobile-ping-hop"
+    req = ctypes.create_string_buffer(data, len(data))
+    size = ctypes.sizeof(ICMP_ECHO_REPLY) + len(data) + 64
+    reply = ctypes.create_string_buffer(size)
+    opts = IP_OPTION_INFORMATION()
+    opts.Ttl = 1
+    try:
+        n = iphlpapi.IcmpSendEcho2Ex(
+            handle, None, None, None, _ipaddr(src_ip), _ipaddr(dest_ip),
+            ctypes.cast(req, ctypes.c_void_p), ctypes.c_ushort(len(data)),
+            ctypes.byref(opts), ctypes.cast(reply, ctypes.c_void_p),
+            size, int(timeout_ms))
+        if not n:
+            return None, status_text(kernel32.GetLastError())
+        r = ctypes.cast(reply, ctypes.POINTER(ICMP_ECHO_REPLY)).contents
+        return socket.inet_ntoa(struct.pack("<I", r.Address)), status_text(r.Status)
+    finally:
+        iphlpapi.IcmpCloseHandle(handle)
